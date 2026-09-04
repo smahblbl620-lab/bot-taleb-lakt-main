@@ -1,0 +1,25 @@
+{
+    "TARGET_GROUPS": [],
+    "KEYWORDS": [
+        "يسوي",
+        "يحل",
+        "احد",
+        "تعرفون",
+        "ابغى",
+        "ابغي"
+    ],
+    "IGNORE_USERS": [],
+    "ADMINS": [],
+    "BANNED_ADS": [],
+    "SUSPICIOUS_WORDS": [],
+    "FILTERS": {
+        "max_length": 0,
+        "block_links": false,
+        "block_phones": false,
+        "block_mentions": false,
+        "block_ads": false,
+        "block_suspicious": false
+    },
+    "DUPLICATE_DETECTION": true,
+    "DETECT_LINKS": true
+}
