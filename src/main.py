@@ -96,8 +96,11 @@ active_clients = {}  # {phone: TelegramClient}
 login_states = {}    # {user_id: {'step': 'phone/code', 'phone': '...', 'hash': '...'}}
 
 # ============ نظام صلاحيات الأدمن ============
-# الأدمن الرئيسي — يقدر يضيف/يحذف أدمن آخرين ويتحكم بكل شيء
-MAIN_ADMIN_ID = 7853478744
+# الأدمن الرئيسي — يُقرأ من متغير البيئة ADMIN_ID (مع قيمة احتياطية للتوافق مع الإعدادات القديمة)
+try:
+    MAIN_ADMIN_ID = int(os.getenv('ADMIN_ID', '7853478744') or '7853478744')
+except (TypeError, ValueError):
+    MAIN_ADMIN_ID = 7853478744
 
 def is_admin(user_id):
     """فحص إذا كان المستخدم أدمن (رئيسي أو مُضاف في قائمة ADMINS)"""
