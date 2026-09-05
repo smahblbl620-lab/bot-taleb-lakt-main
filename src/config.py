@@ -39,7 +39,9 @@ def load_json_config():
             "block_mentions": False,
             "block_ads": False,
             "block_suspicious": False
-        }
+        },
+        "ADMIN_GROUP_ID": 0,
+        "ADMIN_PERMISSIONS": {}
     }
     
     if os.path.exists(CONFIG_FILE):

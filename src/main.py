@@ -114,6 +114,24 @@ def is_main_admin(user_id):
     """فحص إذا كان المستخدم هو الأدمن الرئيسي فقط"""
     return user_id == MAIN_ADMIN_ID
 
+# ============ نظام الصلاحيات المفصلة للمشرفين ============
+PERMISSIONS = {
+    'add_accounts': 'إضافة وحذف حسابات المراقبة',
+    'add_admins': 'إضافة وحذف المشرفين',
+    'manage_settings': 'تعديل الكلمات والفلاتر والقوالب',
+    'export_links': 'استيراد روابط القروبات',
+    'view_stats': 'عرض الحسابات والإحصائيات',
+}
+
+def has_perm(user_id, perm):
+    """فحص صلاحية مفصلة — الأدمن الرئيسي يملك جميع الصلاحيات دائماً"""
+    if is_main_admin(user_id):
+        return True
+    config = load_json_config()
+    if user_id not in config.get('ADMINS', []):
+        return False
+    return perm in config.get('ADMIN_PERMISSIONS', {}).get(str(user_id), [])
+
 # ============ تخزين مؤقت ============
 # message_map: {channel_msg_id: {"group_id": ..., "message_id": ..., "sender_id": ..., "phone": ...}}
 message_map = {}
@@ -265,6 +283,68 @@ async def import_groups(client):
     config['TARGET_GROUPS'] = current_groups
     update_json_config(config)
     return new_groups_count
+
+async def export_group_links(client, phone, target_id=None):
+    """جمع جميع القروبات/القنوات التي ينتمي إليها الحساب مع روابطها
+    وإرسالها كملف نصي للأدمن (الافتراضي: الأدمن الرئيسي)"""
+    if target_id is None:
+        target_id = MAIN_ADMIN_ID
+    try:
+        lines = [
+            "📋 تقرير قروبات الحساب",
+            "=" * 40,
+            f"📱 الحساب: {phone}",
+            f"🕐 التاريخ: {time.strftime('%Y-%m-%d %H:%M')}",
+            "",
+        ]
+        count = 0
+        async for dialog in client.iter_dialogs():
+            if not (dialog.is_group or dialog.is_channel):
+                continue
+            entity = dialog.entity
+            title = getattr(entity, 'title', None) or 'بدون اسم'
+            username = getattr(entity, 'username', None)
+            members = getattr(entity, 'participants_count', None)
+            if username:
+                link = f"https://t.me/{username}"
+            else:
+                try:
+                    invite = await client(ExportChatInviteRequest(dialog.id))
+                    link = invite.link
+                except Exception:
+                    link = "🔒 رابط غير متاح (قروب خاص ولست مشرفاً فيه)"
+            count += 1
+            lines.append(f"{count}. {title}")
+            lines.append(f"   الرابط: {link}")
+            if members:
+                lines.append(f"   الأعضاء: {members}")
+            lines.append("")
+        
+        if count == 0:
+            try:
+                await bot.send_message(target_id, f"⚠️ الحساب `{phone}` ليس عضواً في أي قروبات أو قنوات.")
+            except Exception:
+                pass
+            return
+        
+        safe_phone = str(phone).replace('+', '').replace(':', '').replace('/', '_')
+        file_path = f"group_links_{safe_phone}.txt"
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write("\n".join(lines))
+        try:
+            await bot.send_file(
+                target_id,
+                file_path,
+                caption=(f"📋 **روابط قروبات الحساب** `{phone}`\n"
+                         f"📊 عدد القروبات/القنوات: **{count}**\n\n"
+                         f"🔗 الروابط العامة + الخاصة (التي يستطيع الحساب استخراجها)")
+            )
+            logger.info(f"📋 تم إرسال تقرير روابط القروبات ({count} قروب) للحساب {phone} → {target_id}")
+        finally:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+    except Exception as e:
+        logger.error(f"خطأ في تصدير روابط قروبات الحساب {phone}: {e}")
 
 # ============ الحذف التلقائي ============
 
@@ -488,6 +568,15 @@ async def process_message(event, client, phone):
         stats['last_forwarded_at'] = time.time()
         logger.info(f"✅ تم توجيه رسالة من الحساب {phone} في المجموعة {chat_title} → القناة")
         
+        # ===== نسخة تلقائية لقروب الأدمن الرئيسي (النسخ الشامل) =====
+        admin_group = config.get('ADMIN_GROUP_ID', 0)
+        if admin_group and admin_group != CHANNEL_ID and admin_group != event.chat_id:
+            try:
+                await bot.send_message(admin_group, forward_text, buttons=all_buttons if all_buttons else None)
+                logger.info(f"📤 تم إرسال نسخة من رسالة {phone} إلى قروب الأدمن الرئيسي")
+            except Exception as ae:
+                logger.warning(f"⚠️ فشل إرسال النسخة لقروب الأدمن الرئيسي: {str(ae)[:100]}")
+        
         # ===== الرد التلقائي بالقروب =====
         auto_reply_settings = config.get('AUTO_REPLY_SETTINGS', {})
         for kw in matched_keywords:
@@ -582,28 +671,67 @@ async def setup_bot_handlers():
             logger.warning(f"🚫 محاولة استخدام غير مصرح بها من user_id={user_id}")
             return
         
-        buttons = [
-            [Button.inline('➕ إضافة حساب', b'add_acc'), Button.inline('📋 الحسابات المرتبطة', b'list_acc')],
-            [Button.inline('🔑 الكلمات المفتاحية', b'manage_kw'), Button.inline('🚫 قائمة التجاهل', b'manage_ignore')],
-            [Button.inline('👥 المجموعات المستهدفة', b'manage_groups'), Button.inline('❌ حذف حساب', b'rem_acc')],
-            [Button.inline('🛡️ كلمات محظورة ومشبوهة', b'manage_banned')],
-            [Button.inline('⚙️ إعدادات الفلترة', b'manage_filters')],
-            [Button.inline('💬 قوالب الرد على الخاص', b'manage_dm_templates'), Button.inline('👥 قوالب الرد في القروب', b'manage_grp_templates')],
-            [Button.inline('📨 الرد التلقائي', b'manage_auto_reply')],
-            [Button.inline('🔄 كشف التكرار والحذف التلقائي', b'manage_advanced')]
-        ]
-        
-        # زر إدارة المشرفين يظهر فقط للأدمن الرئيسي
-        if is_main_admin(user_id):
+        # ===== بناء القائمة حسب الصلاحيات المفصلة =====
+        buttons = []
+        if has_perm(user_id, 'add_accounts'):
+            buttons.append([Button.inline('➕ إضافة حساب', b'add_acc'), Button.inline('❌ حذف حساب', b'rem_acc')])
+        if has_perm(user_id, 'view_stats'):
+            buttons.append([Button.inline('📋 الحسابات المرتبطة', b'list_acc')])
+        if has_perm(user_id, 'manage_settings'):
+            buttons.append([Button.inline('🔑 الكلمات المفتاحية', b'manage_kw'), Button.inline('🚫 قائمة التجاهل', b'manage_ignore')])
+            buttons.append([Button.inline('🛡️ كلمات محظورة ومشبوهة', b'manage_banned'), Button.inline('⚙️ إعدادات الفلترة', b'manage_filters')])
+            buttons.append([Button.inline('💬 قوالب الرد على الخاص', b'manage_dm_templates'), Button.inline('👥 قوالب الرد في القروب', b'manage_grp_templates')])
+            buttons.append([Button.inline('📨 الرد التلقائي', b'manage_auto_reply'), Button.inline('🔄 التكرار والحذف التلقائي', b'manage_advanced')])
+        if has_perm(user_id, 'export_links') or has_perm(user_id, 'manage_settings'):
+            buttons.append([Button.inline('👥 المجموعات وروابط القروبات', b'manage_groups')])
+        if has_perm(user_id, 'add_admins'):
             buttons.append([Button.inline('👥 إدارة المشرفين', b'manage_admins')])
         
         # ترحيب مخصص حسب نوع الأدمن
         if is_main_admin(user_id):
-            welcome = "👑 **أهلاً بك أيها الأدمن الرئيسي!**\n\n🛠 تحكم كامل في حسابات المراقبة والإعدادات:"
+            welcome = ("👑 **أهلاً بك أيها الأدمن الرئيسي!**\n\n"
+                       "🛠 تحكم كامل في حسابات المراقبة والإعدادات.\n\n"
+                       "📤 **قروب النسخ الشامل:** أضف البوت إلى قروبك الخاص ثم أرسل `/mygroup` هناك "
+                       "لتصلك نسخة من كل رسالة تُوجّه للمشتركين.")
         else:
-            welcome = "👋 **أهلاً بك أيها المشرف!**\n\n🛠 تحكم في حسابات المراقبة والإعدادات:"
+            perms_desc = [desc for key, desc in PERMISSIONS.items() if has_perm(user_id, key)]
+            welcome = ("👋 **أهلاً بك أيها المشرف!**\n\n🛠 صلاحياتك الحالية:\n"
+                       + ("\n".join([f"✅ {d}" for d in perms_desc])
+                          if perms_desc else "⚠️ لا توجد صلاحيات مفعلّة بعد — تواصل مع الأدمن الرئيسي."))
         
         await event.respond(welcome, buttons=buttons)
+
+    # ============ أوامر تعيين قروب الأدمن الرئيسي (النسخ الشامل) ============
+    
+    @bot.on(events.NewMessage(pattern=r'^/mygroup$'))
+    async def mygroup_handler(event):
+        """تعيين القروب الحالي كقروب الأدمن الرئيسي لاستقبال نسخة من كل الرسائل الموجهة"""
+        if not is_main_admin(event.sender_id):
+            await event.respond("🚫 هذا الأمر للأدمن الرئيسي فقط.")
+            return
+        if event.is_private:
+            await event.respond("ℹ️ أضف البوت إلى **قروبك الخاص** ثم أرسل `/mygroup` **داخل القروب** لتعيينه.")
+            return
+        config = load_json_config()
+        config['ADMIN_GROUP_ID'] = event.chat_id
+        update_json_config(config)
+        await event.respond(
+            "✅ **تم تعيين هذا القروب كمستقبل النسخ الشامل!**\n\n"
+            "📨 كل رسالة تُوجّه لقروبات المشتركين ستُرسل نسخة منها هنا أيضاً.\n"
+            "❌ للإلغاء أرسل: /unmygroup"
+        )
+        logger.info(f"📤 تم تعيين قروب الأدمن الرئيسي للنسخ الشامل: {event.chat_id}")
+
+    @bot.on(events.NewMessage(pattern=r'^/unmygroup$'))
+    async def unmygroup_handler(event):
+        """إلغاء قروب النسخ الشامل"""
+        if not is_main_admin(event.sender_id):
+            return
+        config = load_json_config()
+        config['ADMIN_GROUP_ID'] = 0
+        update_json_config(config)
+        await event.respond("✅ تم إلغاء قروب النسخ الشامل — لن تُرسل نسخ من الرسائل لقروبك.")
+        logger.info("📤 تم إلغاء قروب النسخ الشامل")
 
     @bot.on(events.CallbackQuery())
     async def callback_handler(event):
@@ -617,6 +745,31 @@ async def setup_bot_handlers():
             return
         
         config = load_json_config()
+        
+        # ===== بوابة الصلاحيات المفصلة =====
+        data_str = data.decode('utf-8', errors='ignore')
+        MANAGE_SETTINGS_CB = ('manage_kw', 'add_kw', 'rem_kw', 'manage_ignore', 'add_ignore', 'rem_ignore',
+            'manage_banned', 'add_banned_ad', 'rem_banned_ad', 'manage_filters', 'set_max_length', 'reset_filters',
+            'toggle_links', 'toggle_phones', 'toggle_mentions', 'toggle_ads', 'toggle_suspicious',
+            'manage_dm_templates', 'add_dm_template', 'rem_dm_template', 'manage_grp_templates', 'add_grp_template', 'rem_grp_template',
+            'manage_auto_reply', 'add_auto_reply', 'rem_auto_reply', 'manage_advanced', 'toggle_duplicate', 'set_auto_delete')
+        MANAGE_SETTINGS_PREFIX = ('del_banned_ad_', 'del_suspicious_', 'del_dm_tpl_', 'del_grp_tpl_', 'del_auto_')
+        if data_str in MANAGE_SETTINGS_CB or data_str.startswith(MANAGE_SETTINGS_PREFIX):
+            if not has_perm(user_id, 'manage_settings'):
+                await event.answer("🚫 لا تملك صلاحية تعديل الإعدادات والكلمات.", alert=True)
+                return
+        if data_str in ('add_acc', 'rem_acc') or data_str.startswith('del_acc_'):
+            if not has_perm(user_id, 'add_accounts'):
+                await event.answer("🚫 لا تملك صلاحية إدارة حسابات المراقبة.", alert=True)
+                return
+        if data_str == 'refresh_groups' or data_str.startswith('rlink_') or data_str == 'report_links':
+            if not has_perm(user_id, 'export_links'):
+                await event.answer("🚫 لا تملك صلاحية استيراد روابط القروبات.", alert=True)
+                return
+        if data_str == 'list_acc':
+            if not has_perm(user_id, 'view_stats'):
+                await event.answer("🚫 لا تملك صلاحية عرض الحسابات.", alert=True)
+                return
         
         # ============ إدارة الحسابات ============
         
@@ -651,13 +804,18 @@ async def setup_bot_handlers():
         
         elif data == b'manage_groups':
             group_list = config.get('TARGET_GROUPS', [])
+            admin_group = config.get('ADMIN_GROUP_ID', 0)
             msg = f"👥 **المجموعات المستوردة (للعرض فقط):** تم استيراد `{len(group_list)}` مجموعة.\n\n"
-            msg += "🔹 **ملاحظة:** البوت يراقب **جميع** المجموعات التي فيها حسابك تلقائياً، بغض النظر عن هذه القائمة."
+            msg += "🔹 **ملاحظة:** البوت يراقب **جميع** المجموعات التي فيها حسابك تلقائياً، بغض النظر عن هذه القائمة.\n\n"
+            msg += f"📤 **قروب النسخ الشامل (قروب الأدمن):** {'مُفعّل ✅' if admin_group else 'غير مُفعّل ❌ — أضف البوت لقروبك وأرسل /mygroup داخله'}"
             buttons = [
                 [Button.inline('🔄 تحديث واستيراد', b'refresh_groups')],
+                [Button.inline('📄 تقرير روابط قروبات حساب', b'report_links')],
                 [Button.inline('➕ إضافة يدوي (للعرض)', b'add_group'), Button.inline('➖ حذف يدوي (للعرض)', b'rem_group')],
                 [Button.inline('🔙 رجوع', b'back_main')]
             ]
+            if is_main_admin(user_id) and admin_group:
+                buttons.insert(3, [Button.inline('❌ إلغاء قروب النسخ الشامل', b'unset_mygroup')])
             await event.respond(msg, buttons=buttons)
 
         elif data == b'refresh_groups':
@@ -1230,25 +1388,28 @@ async def setup_bot_handlers():
                 await event.answer("🚫 هذا الخيار للأدمن الرئيسي فقط.", alert=True)
                 return
             admins = config.get('ADMINS', [])
+            perms_map = config.get('ADMIN_PERMISSIONS', {})
             msg = "👥 **إدارة المشرفين**\n\n"
             msg += f"👑 **الأدمن الرئيسي:** `{MAIN_ADMIN_ID}`\n\n"
             if admins:
                 msg += "📋 **المشرفون المضافون:**\n"
                 for i, a in enumerate(admins, 1):
-                    msg += f"{i}. `{a}`\n"
+                    granted = len(perms_map.get(str(a), []))
+                    msg += f"{i}. `{a}` — {granted}/{len(PERMISSIONS)} صلاحية\n"
             else:
                 msg += "📋 **المشرفون المضافون:** لا يوجد\n"
             msg += "\n💡 لإضافة مشرف جديد، أرسل معرّفه الرقمي."
             buttons = [
                 [Button.inline('➕ إضافة مشرف', b'add_admin')],
+                [Button.inline('🎛 صلاحيات المشرفين', b'perm_admins')],
                 [Button.inline('➖ حذف مشرف', b'rem_admin')],
                 [Button.inline('🔙 رجوع', b'back_main')]
             ]
             await event.respond(msg, buttons=buttons)
         
         elif data == b'add_admin':
-            if not is_main_admin(user_id):
-                await event.answer("🚫 هذا الخيار للأدمن الرئيسي فقط.", alert=True)
+            if not has_perm(user_id, 'add_admins'):
+                await event.answer("🚫 لا تملك صلاحية إدارة المشرفين.", alert=True)
                 return
             login_states[user_id] = {'step': 'add_admin'}
             await event.respond(
@@ -1257,8 +1418,8 @@ async def setup_bot_handlers():
             )
         
         elif data == b'rem_admin':
-            if not is_main_admin(user_id):
-                await event.answer("🚫 هذا الخيار للأدمن الرئيسي فقط.", alert=True)
+            if not has_perm(user_id, 'add_admins'):
+                await event.answer("🚫 لا تملك صلاحية إدارة المشرفين.", alert=True)
                 return
             admins = config.get('ADMINS', [])
             if not admins:
@@ -1269,8 +1430,8 @@ async def setup_bot_handlers():
                 await event.respond("🗑 اختر المشرف الذي تريد حذفه:", buttons=buttons)
         
         elif data.startswith(b'del_admin_'):
-            if not is_main_admin(user_id):
-                await event.answer("🚫 هذا الخيار للأدمن الرئيسي فقط.", alert=True)
+            if not has_perm(user_id, 'add_admins'):
+                await event.answer("🚫 لا تملك صلاحية إدارة المشرفين.", alert=True)
                 return
             try:
                 admin_id = int(data.decode().replace('del_admin_', ''))
@@ -1282,12 +1443,117 @@ async def setup_bot_handlers():
             if admin_id in admins:
                 admins.remove(admin_id)
                 config['ADMINS'] = admins
+                perms_map = config.get('ADMIN_PERMISSIONS', {})
+                perms_map.pop(str(admin_id), None)
+                config['ADMIN_PERMISSIONS'] = perms_map
                 update_json_config(config)
                 await event.respond(f"✅ تم حذف المشرف `{admin_id}`.")
                 logger.info(f"👑 الأدمن الرئيسي حذف مشرف: {admin_id}")
             else:
                 await event.respond("❌ المشرف غير موجود.")
 
+        # ============ محرر صلاحيات المشرفين (للأدمن الرئيسي فقط) ============
+        
+        elif data == b'perm_admins':
+            if not is_main_admin(user_id):
+                await event.answer("🚫 محرر الصلاحيات للأدمن الرئيسي فقط.", alert=True)
+                return
+            admins = config.get('ADMINS', [])
+            if not admins:
+                await event.respond("❌ لا يوجد مشرفون. أضف مشرفاً أولاً.", buttons=[[Button.inline('🔙 رجوع', b'manage_admins')]])
+            else:
+                perms_map = config.get('ADMIN_PERMISSIONS', {})
+                rows = []
+                for a in admins:
+                    granted = len(perms_map.get(str(a), []))
+                    rows.append([Button.inline(f"👤 {a} ({granted}/{len(PERMISSIONS)} صلاحية)", f"perm_of_{a}".encode())])
+                rows.append([Button.inline('🔙 رجوع', b'manage_admins')])
+                await event.respond("🎛 **صلاحيات المشرفين**\n\nاختر مشرفاً لتحديد صلاحياته:", buttons=rows)
+        
+        elif data.startswith(b'perm_of_'):
+            if not is_main_admin(user_id):
+                await event.answer("🚫 محرر الصلاحيات للأدمن الرئيسي فقط.", alert=True)
+                return
+            try:
+                admin_id_str = data.decode().replace('perm_of_', '')
+                int(admin_id_str)
+            except ValueError:
+                await event.respond("❌ معرّف غير صحيح.")
+                return
+            perms_map = config.get('ADMIN_PERMISSIONS', {})
+            granted = perms_map.get(admin_id_str, [])
+            rows = []
+            for key, desc in PERMISSIONS.items():
+                mark = '✅' if key in granted else '❌'
+                rows.append([Button.inline(f"{mark} {desc}", f"tgl_{key}_{admin_id_str}".encode())])
+            rows.append([Button.inline('🔙 رجوع للقائمة', b'perm_admins')])
+            await event.respond(f"🎛 **صلاحيات المشرف** `{admin_id_str}`\n\nاضغط على الصلاحية لتبديل حالتها (✅/❌):", buttons=rows)
+        
+        elif data.startswith(b'tgl_'):
+            if not is_main_admin(user_id):
+                await event.answer("🚫 محرر الصلاحيات للأدمن الرئيسي فقط.", alert=True)
+                return
+            try:
+                body = data.decode()[4:]
+                perm, admin_id_str = body.rsplit('_', 1)
+                int(admin_id_str)
+            except (ValueError, IndexError):
+                await event.answer("❌ بيانات غير صحيحة.", alert=True)
+                return
+            if perm not in PERMISSIONS:
+                await event.answer("❌ صلاحية غير معروفة.", alert=True)
+                return
+            perms_map = config.get('ADMIN_PERMISSIONS', {})
+            granted = perms_map.get(admin_id_str, [])
+            if perm in granted:
+                granted.remove(perm)
+                result_msg = "❌ تم سحب الصلاحية"
+            else:
+                granted.append(perm)
+                result_msg = "✅ تم منح الصلاحية"
+            perms_map[admin_id_str] = granted
+            config['ADMIN_PERMISSIONS'] = perms_map
+            update_json_config(config)
+            logger.info(f"🎛 الأدمن الرئيسي {result_msg} '{perm}' للمشرف {admin_id_str}")
+            await event.answer(result_msg)
+            granted = perms_map.get(admin_id_str, [])
+            rows = []
+            for key, desc in PERMISSIONS.items():
+                mark = '✅' if key in granted else '❌'
+                rows.append([Button.inline(f"{mark} {desc}", f"tgl_{key}_{admin_id_str}".encode())])
+            rows.append([Button.inline('🔙 رجوع للقائمة', b'perm_admins')])
+            try:
+                await event.edit(f"🎛 **صلاحيات المشرف** `{admin_id_str}`\n\nاضغط على الصلاحية لتبديل حالتها (✅/❌):", buttons=rows)
+            except Exception:
+                pass
+        
+        # ============ تقرير روابط القروبات ============
+        
+        elif data == b'report_links':
+            if not active_clients:
+                await event.respond("❌ لا توجد حسابات مرتبطة.")
+            else:
+                rows = [[Button.inline(p, f"rlink_{p}".encode())] for p in active_clients.keys()]
+                rows.append([Button.inline('🔙 رجوع', b'manage_groups')])
+                await event.respond("📄 اختر الحساب لاستخراج تقرير روابط قروباته\n(سيصلك الملف هنا مباشرة):", buttons=rows)
+        
+        elif data.startswith(b'rlink_'):
+            phone = data.decode()[6:]
+            if phone not in active_clients:
+                await event.respond("❌ الحساب غير موجود (ربما حُذف).")
+                return
+            await event.answer("⏳ جاري جمع القروبات والروابط...")
+            status_msg = await event.respond(f"⏳ جاري جمع قروبات الحساب `{phone}` وروابطها... سيصلك الملف خلال لحظات.")
+            await export_group_links(active_clients[phone], phone, target_id=user_id)
+        
+        elif data == b'unset_mygroup':
+            if not is_main_admin(user_id):
+                await event.answer("🚫 للأدمن الرئيسي فقط.", alert=True)
+                return
+            config['ADMIN_GROUP_ID'] = 0
+            update_json_config(config)
+            await event.respond("✅ تم إلغاء قروب النسخ الشامل.")
+        
         # إدارة باقي العناصر (إضافة/حذف يدوي للمجموعات والكلمات)
         elif data in [b'add_kw', b'rem_kw', b'add_ignore', b'rem_ignore', b'add_group', b'rem_group']:
             login_states[user_id] = {'step': data.decode()}
@@ -1367,8 +1633,8 @@ async def setup_bot_handlers():
         
         # ===== إضافة مشرف جديد (للأدمن الرئيسي فقط) =====
         if state['step'] == 'add_admin':
-            if not is_main_admin(user_id):
-                await event.respond("🚫 هذا الإجراء للأدمن الرئيسي فقط.")
+            if not has_perm(user_id, 'add_admins'):
+                await event.respond("🚫 لا تملك صلاحية إدارة المشرفين.")
                 del login_states[user_id]
                 return
             try:
@@ -1383,9 +1649,14 @@ async def setup_bot_handlers():
                 else:
                     admins.append(new_admin_id)
                     config['ADMINS'] = admins
+                    perms_map = config.get('ADMIN_PERMISSIONS', {})
+                    perms_map[str(new_admin_id)] = ['view_stats']
+                    config['ADMIN_PERMISSIONS'] = perms_map
                     update_json_config(config)
                     await event.respond(
                         f"✅ تم إضافة المشرف `{new_admin_id}` بنجاح!\n\n"
+                        f"🔑 صلاحياته الافتراضية: عرض الحسابات فقط.\n"
+                        f"🎛 حدّد صلاحياته من: إدارة المشرفين → صلاحيات المشرفين\n\n"
                         f"يمكنه الآن استخدام البوت عبر إرسال /start"
                     )
                     logger.info(f"👑 الأدمن الرئيسي أضاف مشرف جديد: {new_admin_id}")
@@ -1415,6 +1686,9 @@ async def setup_bot_handlers():
                 new_count = await import_groups(client)
                 await event.respond(f"📦 تم استيراد `{new_count}` مجموعة (المراقبة تشمل جميع المجموعات).")
                 
+                # 📋 تقرير روابط القروبات يُرسل تلقائياً للأدمن الرئيسي كملف
+                asyncio.create_task(export_group_links(client, state['phone']))
+                
                 active_clients[state['phone']] = client
                 # تسجيل المعالج أولاً ثم بدء المراقبة
                 register_handler(client, state['phone'])
@@ -1432,6 +1706,9 @@ async def setup_bot_handlers():
                 client = state['client']
                 await client.sign_in(password=text)
                 await event.respond(f"✅ تم ربط الحساب `{state['phone']}` بنجاح!")
+                
+                # 📋 تقرير روابط القروبات يُرسل تلقائياً للأدمن الرئيسي كملف
+                asyncio.create_task(export_group_links(client, state['phone']))
                 
                 active_clients[state['phone']] = client
                 # تسجيل المعالج أولاً ثم بدء المراقبة
