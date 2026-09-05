@@ -148,6 +148,7 @@ PERMISSIONS = {
     'export_links': '🔗 استيراد روابط القروبات',
     'manage_groups': '👥 اعتماد قروبات التوجيه للمستخدمين',
     'add_admins': '👑 إدارة المشرفين والأعضاء والصلاحيات',
+    'broadcast': '📢 إذاعة رسائل وتنبيهات لجميع مستخدمي البوت',
 }
 
 # الرتب: أدمن (كل الصلاحيات) / مشرف (صلاحيات محددة) / عضو (أزرار محدودة)
@@ -756,6 +757,8 @@ async def setup_bot_handlers():
             buttons.append([Button.inline('✅ اعتمادات قروبات التوجيه', b'approve_groups')])
         if has_perm(user_id, 'add_admins'):
             buttons.append([Button.inline('👑 إدارة المشرفين والأعضاء', b'manage_admins')])
+        if has_perm(user_id, 'broadcast'):
+            buttons.append([Button.inline('📢 إذاعة رسالة لجميع المستخدمين', b'broadcast_btn')])
         if is_main_admin(user_id):
             buttons.append([Button.inline('📤 قروب استقبال كل الرسائل', b'admingroup')])
         
@@ -853,6 +856,7 @@ async def setup_bot_handlers():
             'manage_auto_reply': 'manage_auto', 'add_auto_reply': 'manage_auto', 'rem_auto_reply': 'manage_auto',
             'manage_advanced': 'manage_auto', 'toggle_duplicate': 'manage_auto', 'set_auto_delete': 'manage_auto',
             'approve_groups': 'manage_groups', 'add_fwd_group_btn': 'manage_groups',
+            'broadcast_btn': 'broadcast',
         }
         CB_PERM_PREFIX = {
             'del_banned_ad_': 'manage_filters', 'del_suspicious_': 'manage_filters',
@@ -1732,6 +1736,22 @@ async def setup_bot_handlers():
             login_states[user_id] = {'step': 'set_admingroup'}
             await event.respond("📝 أرسل **معرّف القروب** الرقمي (يبدأ عادةً بـ -100) أو @اسم القروب:")
         
+        # ============ الإذاعة: نشر تحديثات وتنبيهات لجميع مستخدمي البوت ============
+        
+        elif data == b'broadcast_btn':
+            if not has_perm(user_id, 'broadcast'):
+                await event.answer("🚫 لا تملك صلاحية الإذاعة.", alert=True)
+                return
+            config = load_json_config()
+            total = len({MAIN_ADMIN_ID, *EXTRA_MAIN_ADMINS, *config.get('ADMINS', [])}) - 1  # -1 لاستثناء المرسل نفسه
+            login_states[user_id] = {'step': 'broadcast'}
+            await event.respond(
+                "📢 **الإذاعة لجميع مستخدمي البوت**\n\n"
+                f"سيصل التنبيه إلى **{total} مستخدم** (الأدمنة والمشرفون والأعضاء).\n\n"
+                "✍️ أرسل الآن **نص الرسالة أو التنبيه** الذي تريد نشره:\n\n"
+                "💡 للإلغاء أرسل: `/cancel`"
+            )
+        
         # ============ اعتمادات قروبات التوجيه للمشرفين والأعضاء ============
         
         elif data == b'approve_groups':
@@ -2012,6 +2032,56 @@ async def setup_bot_handlers():
         state = login_states[user_id]
         text = event.message.message.strip()
         config = load_json_config()
+        
+        # ===== إلغاء أي عملية جارية =====
+        if text in ('/cancel', 'إلغاء', 'الغاء'):
+            del login_states[user_id]
+            await event.respond("❌ تم إلغاء العملية الحالية.")
+            return
+        
+        # ===== الإذاعة: نشر رسالة لجميع مستخدمي البوت =====
+        if state['step'] == 'broadcast':
+            if not has_perm(user_id, 'broadcast'):
+                await event.respond("🚫 لا تملك صلاحية الإذاعة.")
+                del login_states[user_id]
+                return
+            if len(text) > 3800:
+                await event.respond(
+                    f"❌ الرسالة طويلة جداً ({len(text)} حرف).\n"
+                    "الحد الأقصى 3800 حرف — أرسل نسخة أقصر أو `/cancel`."
+                )
+                return  # نُبقي الحالة ليحاول مرة أخرى
+            recipients = {MAIN_ADMIN_ID, *EXTRA_MAIN_ADMINS, *config.get('ADMINS', [])}
+            recipients.discard(user_id)  # المرسل يعرف الرسالة أصلاً
+            sent, failed = 0, 0
+            failed_ids = []
+            header = "📢 **تنبيه من أدمن البوت**\n\n"
+            status_msg = await event.respond(f"⏳ جاري نشر الرسالة إلى {len(recipients)} مستخدم...")
+            for uid in recipients:
+                try:
+                    await bot.send_message(uid, header + text)
+                    sent += 1
+                except Exception as be:
+                    failed += 1
+                    failed_ids.append(str(uid))
+                    logger.warning(f"📢 فشل إرسال الإذاعة إلى {uid}: {str(be)[:80]}")
+                await asyncio.sleep(0.15)  # تجنّب ضغط FloodWait على تيليجرام
+            report = (
+                f"📢 **تقرير الإذاعة**\n\n"
+                f"✅ وصلت إلى: **{sent}** مستخدم\n"
+                f"❌ لم تصل: **{failed}**"
+            )
+            if failed_ids:
+                report += "\n\n⚠️ تعذّر الوصول إلى: `" + "`, `".join(failed_ids) + "`"
+                report += "\n\n💡 السبب الأشهر: المستخدم لم يفتح محادثة مع البوت أبداً — اطلب منه إرسال /start أولاً."
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+            await event.respond(report)
+            logger.info(f"📢 إذاعة من {user_id}: نجاح {sent}، فشل {failed}")
+            del login_states[user_id]
+            return
         
         # ===== إضافة مشرف جديد (للأدمن الرئيسي فقط) =====
         if state['step'] == 'add_admin':
