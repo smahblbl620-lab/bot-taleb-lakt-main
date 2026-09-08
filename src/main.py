@@ -151,25 +151,42 @@ PERMISSIONS = {
     'broadcast': '📢 إذاعة رسائل وتنبيهات لجميع مستخدمي البوت',
 }
 
-# الرتب: أدمن (كل الصلاحيات) / مشرف (صلاحيات محددة) / عضو (أزرار محدودة)
+# الرتب: أدمن (كل الصلاحيات) / مستخدم (يضيف حسابه ويستخدم ما تسمح به صلاحياته)
 ROLES = {
     'admin': '🛡 أدمن',
-    'supervisor': '🎛 مشرف',
-    'user': '👤 عضو',
+    'user': '👤 مستخدم',
 }
 
 def get_user_role(user_id):
-    """دور المستخدم: الأدمن الرئيسي/الثابت = owner، وإلا من ADMIN_ROLES (الافتراضي مشرف)"""
+    """دور المستخدم: الأدمن الرئيسي/الثابت = owner، وإلا من ADMIN_ROLES (الافتراضي مستخدم)
+    القيم القديمة 'supervisor' تُعامل كـ 'user' (تم حذف دور المشرف)"""
     if is_main_admin(user_id):
         return 'owner'
     config = load_json_config()
-    return config.get('ADMIN_ROLES', {}).get(str(user_id), 'supervisor')
+    role = config.get('ADMIN_ROLES', {}).get(str(user_id), 'user')
+    return 'user' if role == 'supervisor' else role
 
 def is_full_admin(user_id):
     """أدمن كامل الصلاحيات: الأدمن الرئيسي/الثابت أو مستخدم برتبة 'أدمن'"""
     if is_main_admin(user_id):
         return True
     return get_user_role(user_id) == 'admin'
+
+def set_account_owner(phone, owner_id):
+    """ربط حساب مراقب بمالكه (المستخدم الذي أضافه) — يسمح لكل مستخدم بإدارة حسابه"""
+    if not owner_id or not phone:
+        return
+    config = load_json_config()
+    ow = config.get('ACCOUNT_OWNERS', {})
+    ow[str(phone)] = int(owner_id)
+    config['ACCOUNT_OWNERS'] = ow
+    update_json_config(config)
+
+def get_owned_accounts(user_id):
+    """قائمة الهواتف المملوكة لمستخدم محدد"""
+    config = load_json_config()
+    ow = config.get('ACCOUNT_OWNERS', {})
+    return [phone for phone, owner in ow.items() if owner == user_id or str(owner) == str(user_id)]
 
 def has_perm(user_id, perm):
     """فحص صلاحية مفصلة — الأدمن الكامل يملك جميع الصلاحيات دائماً"""
@@ -738,10 +755,16 @@ async def setup_bot_handlers():
             return
         
         # ===== بناء القائمة حسب الصلاحيات المفصلة (الأدمن يتحكم بالأزرار التي تظهر لكل مستخدم) =====
+        # إضافة حساب متاحة لجميع مستخدمي البوت (أدمن ومستخدم) — كل مستخدم يضيف حسابه الخاص دون خطأ
+        owned_accounts = get_owned_accounts(user_id)
         buttons = []
         if has_perm(user_id, 'add_accounts'):
             buttons.append([Button.inline('➕ إضافة حساب', b'add_acc'), Button.inline('❌ حذف حساب', b'rem_acc')])
-        if has_perm(user_id, 'view_stats'):
+        else:
+            buttons.append([Button.inline('➕ إضافة حسابي', b'add_acc')])
+            if owned_accounts:
+                buttons.append([Button.inline('❌ حذف حسابي', b'rem_acc')])
+        if has_perm(user_id, 'view_stats') or owned_accounts:
             buttons.append([Button.inline('📋 الحسابات المرتبطة', b'list_acc')])
         if has_perm(user_id, 'manage_keywords'):
             buttons.append([Button.inline('🔑 الكلمات المفتاحية', b'manage_kw'), Button.inline('🚫 قائمة التجاهل', b'manage_ignore')])
@@ -769,7 +792,7 @@ async def setup_bot_handlers():
                        "📤 **قروب النسخ الشامل:** أضف البوت إلى قروبك الخاص ثم أرسل `/mygroup` هناك "
                        "لتصلك نسخة من كل رسالة تُوجّه للمشتركين.")
         else:
-            role_label = ROLES.get(get_user_role(user_id), '🎛 مشرف')
+            role_label = ROLES.get(get_user_role(user_id), '👤 مستخدم')
             perms_desc = [desc for key, desc in PERMISSIONS.items() if has_perm(user_id, key)]
             welcome = (f"👋 **أهلاً بك!** — رتبتك: {role_label}\n\n🛠 الأزرار المتاحة لك (يحددها الأدمن):\n"
                        + ("\n".join([f"✅ {d}" for d in perms_desc])
@@ -814,19 +837,22 @@ async def setup_bot_handlers():
         """شاشة رتبة وصلاحيات مستخدم محدد — الأدمن يتحكم بالأزرار التي تظهر له"""
         perms_map = cfg.get('ADMIN_PERMISSIONS', {})
         roles_map = cfg.get('ADMIN_ROLES', {})
-        role = roles_map.get(admin_id_str, 'supervisor')
+        role = roles_map.get(admin_id_str, 'user')
+        if role == 'supervisor':
+            role = 'user'
         granted = perms_map.get(admin_id_str, [])
         rows = [
-            [Button.inline(('✅' if role == 'admin' else '⬜') + ' رتبة أدمن — كل الصلاحيات', f"setrole_admin_{admin_id_str}".encode())],
-            [Button.inline(('✅' if role == 'supervisor' else '⬜') + ' رتبة مشرف', f"setrole_supervisor_{admin_id_str}".encode()),
-             Button.inline(('✅' if role == 'user' else '⬜') + ' رتبة عضو', f"setrole_user_{admin_id_str}".encode())],
+            [Button.inline(('✅' if role == 'admin' else '⬜') + ' رتبة أدمن — كل الصلاحيات', f"setrole_admin_{admin_id_str}".encode()),
+             Button.inline(('✅' if role == 'user' else '⬜') + ' رتبة مستخدم', f"setrole_user_{admin_id_str}".encode())],
         ]
         for key, desc in PERMISSIONS.items():
             mark = '✅' if (key in granted or role == 'admin') else '❌'
             rows.append([Button.inline(f"{mark} {desc}", f"tgl_{key}_{admin_id_str}".encode())])
         rows.append([Button.inline('🔙 رجوع للقائمة', b'perm_admins')])
         note = "\n⚠️ رتبة (أدمن) تملك كل الصلاحيات تلقائياً." if role == 'admin' else ""
-        text = f"🎛 **رتبة وصلاحيات `{admin_id_str}`**{note}\n\n🏷 اختر الرتبة (أدمن/مشرف/عضو) ثم فعّل/عطّل الصلاحيات — كل صلاحية = زر في قائمته:"
+        text = (f"🎛 **رتبة وصلاحيات `{admin_id_str}`**{note}\n\n"
+                "🏷 رتبتان فقط: **أدمن** (كل الصلاحيات) و**مستخدم** (يضيف حسابه ويستخدم ما تسمح به صلاحياته)\n"
+                "💡 كل صلاحية = زر في قائمته:")
         return text, rows
 
     @bot.on(events.CallbackQuery())
@@ -874,31 +900,50 @@ async def setup_bot_handlers():
         if perm_needed and not has_perm(user_id, perm_needed):
             await event.answer("🚫 لا تملك هذه الصلاحية — تواصل مع الأدمن.", alert=True)
             return
-        if data_str in ('add_acc', 'rem_acc') or data_str.startswith('del_acc_'):
-            if not has_perm(user_id, 'add_accounts'):
-                await event.answer("🚫 لا تملك صلاحية إدارة حسابات المراقبة.", alert=True)
+        if data_str == 'add_acc':
+            pass  # إضافة الحساب متاحة لجميع مستخدمي البوت (أدمن ومستخدم) — كل مستخدم يضيف حسابه
+        elif data_str == 'rem_acc' or data_str.startswith('del_acc_'):
+            owned = len(get_owned_accounts(user_id)) > 0
+            if not (has_perm(user_id, 'add_accounts') or owned):
+                await event.answer("🚫 لا تملك حسابات لإدارتها.", alert=True)
                 return
         if data_str == 'refresh_groups' or data_str.startswith('rlink_') or data_str == 'report_links':
             if not has_perm(user_id, 'export_links'):
                 await event.answer("🚫 لا تملك صلاحية استيراد روابط القروبات.", alert=True)
                 return
         if data_str == 'list_acc':
-            if not has_perm(user_id, 'view_stats'):
-                await event.answer("🚫 لا تملك صلاحية عرض الحسابات.", alert=True)
+            owned = len(get_owned_accounts(user_id)) > 0
+            if not (has_perm(user_id, 'view_stats') or owned):
+                await event.answer("🚫 لا توجد حسابات لعرضها — أضف حسابك أولاً.", alert=True)
                 return
         
         # ============ إدارة الحسابات ============
         
         if data == b'add_acc':
-            login_states[user_id] = {'step': 'await_phone'}
-            await event.respond("📱 من فضلك أرسل **رقم الهاتف** مع مفتاح الدولة (مثال: +9665xxxxxxxx):")
+            login_states[user_id] = {'step': 'await_phone', 'owner': user_id}
+            await event.respond(
+                "📱 من فضلك أرسل **رقم الهاتف** مع مفتاح الدولة (مثال: +9665xxxxxxxx):\n\n"
+                "💡 سيُربط الحساب بحسابك في البوت وتصلك رسائله الملتقطة."
+            )
         
         elif data == b'list_acc':
             if not active_clients:
                 await event.respond("❌ لا توجد حسابات مرتبطة حالياً.")
+            elif has_perm(user_id, 'view_stats'):
+                ow = config.get('ACCOUNT_OWNERS', {})
+                lines = []
+                for p in active_clients.keys():
+                    owner = ow.get(str(p))
+                    tag = f" (مالك: {owner})" if owner else ""
+                    lines.append(f"- `{p}`{tag}")
+                await event.respond("✅ **الحسابات المرتبطة:**\n" + "\n".join(lines))
             else:
-                msg = "✅ **الحسابات المرتبطة:**\n" + "\n".join([f"- `{p}`" for p in active_clients.keys()])
-                await event.respond(msg)
+                owned = get_owned_accounts(user_id)
+                mine = [p for p in active_clients.keys() if p in owned]
+                if mine:
+                    await event.respond("✅ **حساباتك المرتبطة:**\n" + "\n".join([f"- `{p}`" for p in mine]))
+                else:
+                    await event.respond("📭 لا توجد حسابات مرتبطة بحسابك بعد — اضغط ➕ إضافة حسابي لتسجيل حسابك.")
 
         # ============ إدارة الكلمات المفتاحية ============
         
@@ -950,25 +995,44 @@ async def setup_bot_handlers():
             if not active_clients:
                 await event.respond("❌ لا توجد حسابات لحذفها.")
             else:
-                buttons = [[Button.inline(p, f"del_acc_{p}".encode())] for p in active_clients.keys()]
-                buttons.append([Button.inline('🔙 رجوع', b'back_main')])
-                await event.respond("🗑 اختر الحساب الذي تريد حذفه:", buttons=buttons)
+                if has_perm(user_id, 'add_accounts'):
+                    deletable = list(active_clients.keys())
+                    prompt = "🗑 اختر الحساب الذي تريد حذفه:"
+                else:
+                    owned = get_owned_accounts(user_id)
+                    deletable = [p for p in active_clients.keys() if p in owned]
+                    prompt = "🗑 اختر حسابك الذي تريد حذفه:"
+                if not deletable:
+                    await event.respond("📭 لا تملك حسابات يمكن حذفها.")
+                else:
+                    buttons = [[Button.inline(p, f"del_acc_{p}".encode())] for p in deletable]
+                    buttons.append([Button.inline('🔙 رجوع', b'back_main')])
+                    await event.respond(prompt, buttons=buttons)
 
         elif data.startswith(b'del_acc_'):
             phone = data.decode().replace('del_acc_', '')
+            owner = config.get('ACCOUNT_OWNERS', {}).get(phone)
+            can_delete = has_perm(user_id, 'add_accounts') or owner == user_id or owner == str(user_id)
+            if not can_delete:
+                await event.answer("🚫 يمكنك حذف حسابك فقط — تواصل مع الأدمن لحذف حسابات الآخرين.", alert=True)
+                return
             if phone in active_clients:
                 await active_clients[phone].disconnect()
                 del active_clients[phone]
                 if os.path.exists(f'session_{phone}.session'):
                     os.remove(f'session_{phone}.session')
-                # تنظيف اعتمادات القروبات المرتبطة بالحساب المحذوف
+                # تنظيف اعتمادات القروبات وملكية الحساب المحذوف
                 try:
                     cfg_del = load_json_config()
                     ag_map = cfg_del.get('ACCOUNT_GROUPS', {})
                     if phone in ag_map:
                         ag_map.pop(phone, None)
                         cfg_del['ACCOUNT_GROUPS'] = ag_map
-                        update_json_config(cfg_del)
+                    ow_map = cfg_del.get('ACCOUNT_OWNERS', {})
+                    if phone in ow_map:
+                        ow_map.pop(phone, None)
+                        cfg_del['ACCOUNT_OWNERS'] = ow_map
+                    update_json_config(cfg_del)
                 except Exception:
                     pass
                 await event.respond(f"✅ تم حذف الحساب `{phone}` بنجاح.")
@@ -1516,7 +1580,7 @@ async def setup_bot_handlers():
             admins = config.get('ADMINS', [])
             perms_map = config.get('ADMIN_PERMISSIONS', {})
             roles_map = config.get('ADMIN_ROLES', {})
-            msg = "👥 **إدارة المشرفين والأعضاء**\n\n"
+            msg = "👥 **إدارة المستخدمين**\n\n"
             msg += f"👑 **الأدمن الرئيسي:** `{MAIN_ADMIN_ID}`\n"
             extra = sorted(EXTRA_MAIN_ADMINS)
             if extra:
@@ -1525,42 +1589,46 @@ async def setup_bot_handlers():
             if admins:
                 msg += "📋 **المضافون:**\n"
                 for i, a in enumerate(admins, 1):
-                    role = roles_map.get(str(a), 'supervisor')
+                    role = roles_map.get(str(a), 'user')
+                    if role == 'supervisor':
+                        role = 'user'
                     granted = len(perms_map.get(str(a), []))
-                    msg += f"{i}. `{a}` — {ROLES.get(role, '🎛 مشرف')} — {granted}/{len(PERMISSIONS)} صلاحية\n"
+                    msg += f"{i}. `{a}` — {ROLES.get(role, '👤 مستخدم')} — {granted}/{len(PERMISSIONS)} صلاحية\n"
             else:
                 msg += "📋 **المضافون:** لا يوجد\n"
-            msg += "\n💡 لإضافة مشرف أو عضو جديد، أرسل معرّفه الرقمي.\n💡 الرتبة (أدمن) تملك كل الصلاحيات تلقائياً."
+            msg += ("\n💡 لإضافة مستخدم جديد، أرسل معرّفه الرقمي.\n"
+                    "💡 الرتبتان: أدمن (كل الصلاحيات) ومستخدم (يضيف حسابه ويستخدم ما تسمح به صلاحياته).")
             buttons = [
-                [Button.inline('➕ إضافة مشرف/عضو', b'add_admin')],
+                [Button.inline('➕ إضافة مستخدم', b'add_admin')],
                 [Button.inline('🎛 الرتب والصلاحيات', b'perm_admins')],
                 [Button.inline('✅ اعتمادات قروبات التوجيه', b'approve_groups')],
-                [Button.inline('➖ حذف مشرف/عضو', b'rem_admin')],
+                [Button.inline('➖ حذف مستخدم', b'rem_admin')],
                 [Button.inline('🔙 رجوع', b'back_main')]
             ]
             await event.respond(msg, buttons=buttons)
         
         elif data == b'add_admin':
             if not has_perm(user_id, 'add_admins'):
-                await event.answer("🚫 لا تملك صلاحية إدارة المشرفين.", alert=True)
+                await event.answer("🚫 لا تملك صلاحية إدارة المستخدمين.", alert=True)
                 return
             login_states[user_id] = {'step': 'add_admin'}
             await event.respond(
-                "📝 أرسل **معرّف المستخدم الرقمي (ID)** للمشرف الجديد:\n\n"
+                "📝 أرسل **معرّف المستخدم الرقمي (ID)** للمستخدم الجديد:\n\n"
+                "💡 سيدخل برتبة (مستخدم) ويستطيع فوراً إضافة حسابه المراقب بنفسه.\n"
                 "💡 للحصول على المعرّف: توجّه إلى @userinfobot في تيليجرام وأرسل أي رسالة، سيعيد لك معرّفك."
             )
         
         elif data == b'rem_admin':
             if not has_perm(user_id, 'add_admins'):
-                await event.answer("🚫 لا تملك صلاحية إدارة المشرفين.", alert=True)
+                await event.answer("🚫 لا تملك صلاحية إدارة المستخدمين.", alert=True)
                 return
             admins = config.get('ADMINS', [])
             if not admins:
-                await event.respond("❌ لا يوجد مشرفون مضافون للحذف.")
+                await event.respond("❌ لا يوجد مستخدمون مضافون للحذف.")
             else:
                 buttons = [[Button.inline(str(a), f"del_admin_{a}".encode())] for a in admins]
                 buttons.append([Button.inline('🔙 رجوع', b'manage_admins')])
-                await event.respond("🗑 اختر المشرف الذي تريد حذفه:", buttons=buttons)
+                await event.respond("🗑 اختر المستخدم الذي تريد حذفه:", buttons=buttons)
         
         elif data.startswith(b'del_admin_'):
             if not has_perm(user_id, 'add_admins'):
@@ -1584,27 +1652,27 @@ async def setup_bot_handlers():
                 ug_map.pop(str(admin_id), None)
                 config['USER_GROUPS'] = ug_map
                 update_json_config(config)
-                await event.respond(f"✅ تم حذف المشرف `{admin_id}`.")
-                logger.info(f"👑 الأدمن الرئيسي حذف مشرف: {admin_id}")
+                await event.respond(f"✅ تم حذف المستخدم `{admin_id}`.")
+                logger.info(f"👑 الأدمن حذف مستخدم: {admin_id}")
             else:
-                await event.respond("❌ المشرف غير موجود.")
+                await event.respond("❌ المستخدم غير موجود.")
 
         # ============ محرر صلاحيات المشرفين (للأدمن الرئيسي فقط) ============
         
         elif data == b'perm_admins':
             if not has_perm(user_id, 'add_admins'):
-                await event.answer("🚫 لا تملك صلاحية إدارة المشرفين.", alert=True)
+                await event.answer("🚫 لا تملك صلاحية إدارة المستخدمين.", alert=True)
                 return
             admins = config.get('ADMINS', [])
             if not admins:
-                await event.respond("❌ لا يوجد مشرفون. أضف مشرفاً أولاً.", buttons=[[Button.inline('🔙 رجوع', b'manage_admins')]])
+                await event.respond("❌ لا يوجد مستخدمون. أضف مستخدماً أولاً.", buttons=[[Button.inline('🔙 رجوع', b'manage_admins')]])
             else:
                 perms_map = config.get('ADMIN_PERMISSIONS', {})
                 roles_map = config.get('ADMIN_ROLES', {})
                 rows = []
                 for a in admins:
                     granted = len(perms_map.get(str(a), []))
-                    role_l = ROLES.get(roles_map.get(str(a), 'supervisor'), '🎛')
+                    role_l = ROLES.get(roles_map.get(str(a), 'user'), '👤')
                     rows.append([Button.inline(f"{role_l} {a} ({granted}/{len(PERMISSIONS)})", f"perm_of_{a}".encode())])
                 rows.append([Button.inline('🔙 رجوع', b'manage_admins')])
                 await event.respond("🎛 **الرتب والصلاحيات**\n\nاختر مستخدماً لتحديد رتبته وصلاحياته وأزراره:", buttons=rows)
@@ -1772,7 +1840,7 @@ async def setup_bot_handlers():
             rows = []
             for a in users:
                 cnt = len(ug.get(str(a), []))
-                role_l = ROLES.get(roles_map.get(str(a), 'supervisor'), '🎛')
+                role_l = ROLES.get(roles_map.get(str(a), 'user'), '👤')
                 rows.append([Button.inline(f"{role_l} {a} ({cnt} قروب)", f"ugsel_{a}".encode())])
             rows.append([Button.inline('📱 اعتمادات الحسابات المراقبة', b'accsel_menu')])
             rows.append([Button.inline('➕ إضافة قروب إلى القائمة', b'add_fwd_group_btn')])
@@ -2108,14 +2176,17 @@ async def setup_bot_handlers():
                     perms_map = config.get('ADMIN_PERMISSIONS', {})
                     perms_map[str(new_admin_id)] = ['view_stats']
                     config['ADMIN_PERMISSIONS'] = perms_map
+                    roles_map = config.get('ADMIN_ROLES', {})
+                    roles_map[str(new_admin_id)] = 'user'
+                    config['ADMIN_ROLES'] = roles_map
                     update_json_config(config)
                     await event.respond(
-                        f"✅ تم إضافة المشرف `{new_admin_id}` بنجاح!\n\n"
-                        f"🔑 صلاحياته الافتراضية: عرض الحسابات فقط.\n"
-                        f"🎛 حدّد صلاحياته من: إدارة المشرفين → صلاحيات المشرفين\n\n"
+                        f"✅ تم إضافة المستخدم `{new_admin_id}` بنجاح!\n\n"
+                        f"👤 رتبته: مستخدم — يستطيع فوراً إضافة حسابه المراقب بنفسه.\n"
+                        f"🎛 حدّد رتبته وصلاحياته من: إدارة المشرفين → الرتب والصلاحيات\n\n"
                         f"يمكنه الآن استخدام البوت عبر إرسال /start"
                     )
-                    logger.info(f"👑 الأدمن الرئيسي أضاف مشرف جديد: {new_admin_id}")
+                    logger.info(f"👑 الأدمن أضاف مستخدماً جديداً: {new_admin_id}")
                 del login_states[user_id]
             except ValueError:
                 await event.respond("❌ المعرّف غير صحيح. أرسل رقم صحيح (مثال: 7853478744)")
@@ -2189,7 +2260,7 @@ async def setup_bot_handlers():
             await new_client.connect()
             try:
                 sent_code = await new_client.send_code_request(phone)
-                login_states[user_id] = {'step': 'await_code', 'phone': phone, 'hash': sent_code.phone_code_hash, 'client': new_client}
+                login_states[user_id] = {'step': 'await_code', 'phone': phone, 'hash': sent_code.phone_code_hash, 'client': new_client, 'owner': state.get('owner', user_id)}
                 await event.respond(f"📩 تم إرسال الكود إلى `{phone}`. من فضلك أرسل الكود هنا:")
             except Exception as e:
                 await event.respond(f"❌ خطأ: {e}"); del login_states[user_id]
@@ -2208,6 +2279,8 @@ async def setup_bot_handlers():
                 asyncio.create_task(export_group_links(client, state['phone']))
                 
                 active_clients[state['phone']] = client
+                # ربط الحساب بمالكه (المستخدم الذي أضافه) — يتيح له إدارته لاحقاً
+                set_account_owner(state['phone'], state.get('owner') or user_id)
                 # تسجيل المعالج أولاً ثم بدء المراقبة
                 register_handler(client, state['phone'])
                 asyncio.create_task(start_monitoring(client, state['phone']))
@@ -2229,6 +2302,8 @@ async def setup_bot_handlers():
                 asyncio.create_task(export_group_links(client, state['phone']))
                 
                 active_clients[state['phone']] = client
+                # ربط الحساب بمالكه (المستخدم الذي أضافه)
+                set_account_owner(state['phone'], state.get('owner') or user_id)
                 # تسجيل المعالج أولاً ثم بدء المراقبة
                 register_handler(client, state['phone'])
                 asyncio.create_task(start_monitoring(client, state['phone']))
