@@ -4,13 +4,30 @@ import os
 import json
 import re
 import time
+import shutil
 from telethon import TelegramClient, events, Button
 from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError
+from telethon.sessions import StringSession
 from telethon.tl.types import Chat, Channel
 from telethon.tl.functions.messages import ExportChatInviteRequest
 from flask import Flask
 from threading import Thread
-from config import API_ID, API_HASH, BOT_TOKEN, CHANNEL_ID, load_json_config, update_json_config
+from config import API_ID, API_HASH, BOT_TOKEN, CHANNEL_ID, load_json_config, update_json_config, DATA_DIR
+
+# مجلد التخزين الدائم (Railway Volume /data) — لا تفقد البيانات عند إعادة النشر
+SESSION_DIR = DATA_DIR
+CHAT_LOG_FILE = os.path.join(DATA_DIR, 'chat_logs.jsonl')
+# القروب الرسمي لاستقبال كل الرسائل (يُعيّن تلقائياً إذا لم يُضبط قروب آخر)
+OFFICIAL_GROUP = os.getenv('OFFICIAL_GROUP', 'https://t.me/hsjjjjihsjs')
+
+# إعدادات الاتصال السريع والمرن لكل عملاء تيليجرام
+CLIENT_OPTS = dict(
+    flood_sleep_threshold=120,   # نوم تلقائي عند FloodWait بدل الفشل
+    connection_retries=15,       # محاولات اتصال أكثر
+    retry_delay=3,
+    request_retries=6,
+    auto_reconnect=True,
+)
 
 # Logging configuration
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -32,7 +49,9 @@ def status():
     return {
         "bot_started": bot is not None,
         "active_clients": list(active_clients.keys()),
-        "message_map_size": len(message_map)
+        "message_map_size": len(message_map),
+        "data_dir": DATA_DIR,
+        "persistent": DATA_DIR == '/data' or bool(os.getenv('DATA_DIR')),
     }, 200
 
 @app.route('/debug')
@@ -72,6 +91,12 @@ def stats_endpoint():
         "stats": stats,
         "message_map_size": len(message_map),
         "seen_messages_size": len(seen_messages),
+        "data_dir": DATA_DIR,
+        "sessions_persisted": len(load_json_config().get('SESSIONS', {})),
+        "admin_group_id": config.get('ADMIN_GROUP_ID', 0),
+        "official_group": OFFICIAL_GROUP,
+        "log_retention_days": config.get('LOG_RETENTION_DAYS', 3),
+        "chat_log_size_mb": round(os.path.getsize(CHAT_LOG_FILE) / 1048576, 2) if os.path.exists(CHAT_LOG_FILE) else 0,
     }, 200
 
 @app.route('/test_forward')
@@ -196,6 +221,63 @@ def has_perm(user_id, perm):
     if user_id not in config.get('ADMINS', []):
         return False
     return perm in config.get('ADMIN_PERMISSIONS', {}).get(str(user_id), [])
+
+# ============ الحفظ الدائم للجلسات (StringSession في config على الـ Volume) ============
+
+def save_session_string(phone, client):
+    """حفظ جلسة الحساب كسلسلة نصية داخل config.json (المخزن على الـ Volume الدائم)
+    — تضمن استعادة الحساب حتى لو فُقد ملف .session عند إعادة النشر"""
+    try:
+        s = StringSession.save(client.session)
+        config = load_json_config()
+        sess = config.get('SESSIONS', {})
+        sess[str(phone)] = s
+        config['SESSIONS'] = sess
+        update_json_config(config)
+        logger.info(f"💾 تم حفظ جلسة {phone} بشكل دائم (StringSession) — لن تضيع مع إعادة النشر")
+    except Exception as e:
+        logger.error(f"فشل حفظ StringSession لـ {phone}: {e}")
+
+def forget_session_string(phone):
+    """إزالة الجلسة المحفوظة من config عند حذف الحساب"""
+    try:
+        config = load_json_config()
+        sess = config.get('SESSIONS', {})
+        if str(phone) in sess:
+            sess.pop(str(phone), None)
+            config['SESSIONS'] = sess
+            update_json_config(config)
+    except Exception:
+        pass
+
+async def resume_from_string(phone, s):
+    """استعادة حساب مراقب من StringSession المحفوظة في config
+    وتحويلها لملف جلسة على القرص الدائم للاستخدام اللاحق"""
+    disk_client = None
+    try:
+        tmp = TelegramClient(StringSession(s), API_ID, API_HASH, **CLIENT_OPTS)
+        await tmp.connect()
+        if not await tmp.is_user_authorized():
+            await tmp.disconnect()
+            return None
+        disk_client = TelegramClient(os.path.join(SESSION_DIR, f'session_{phone}'), API_ID, API_HASH, **CLIENT_OPTS)
+        await disk_client.connect()
+        disk_client.session.set_dc(tmp.session.dc_id, tmp.session.server_address, tmp.session.port)
+        disk_client.session.auth_key = tmp.session.auth_key
+        disk_client.session.save()
+        await tmp.disconnect()
+        if await disk_client.is_user_authorized():
+            return disk_client
+        await disk_client.disconnect()
+        return None
+    except Exception as e:
+        logger.error(f"فشل استعادة الحساب {phone} من الجلسة المحفوظة: {e}")
+        try:
+            if disk_client:
+                await disk_client.disconnect()
+        except Exception:
+            pass
+        return None
 
 # ============ تخزين مؤقت ============
 # message_map: {channel_msg_id: {"group_id": ..., "message_id": ..., "sender_id": ..., "phone": ...}}
@@ -349,12 +431,23 @@ async def import_groups(client):
     update_json_config(config)
     return new_groups_count
 
-async def export_group_links(client, phone, target_id=None):
+async def export_group_links(client, phone, target_id=None, status_msg=None):
     """جمع جميع القروبات/القنوات التي ينتمي إليها الحساب مع روابطها
-    وإرسالها كملف نصي للأدمن (الافتراضي: الأدمن الرئيسي)"""
+    وإرسالها كملف نصي مباشرة للطالب — مع إشعار مضمون عند النجاح أو الفشل (لا صمت أبداً)"""
     if target_id is None:
         target_id = MAIN_ADMIN_ID
+    file_path = None
     try:
+        # التأكد من اتصال الحساب وأهليته قبل أي شيء
+        if not client.is_connected():
+            await client.connect()
+        if not await client.is_user_authorized():
+            try:
+                await bot.send_message(target_id, f"❌ الحساب `{phone}` غير مصرح أو غير متصل حالياً — أعد إضافته من ➕ إضافة حساب.")
+            except Exception:
+                pass
+            return
+
         lines = [
             "📋 تقرير قروبات الحساب",
             "=" * 40,
@@ -363,9 +456,14 @@ async def export_group_links(client, phone, target_id=None):
             "",
         ]
         count = 0
+        unavailable = 0
+        # جمع القروبات أولاً ثم المعالجة (لعرض تقدم دقيق)
+        dialogs = []
         async for dialog in client.iter_dialogs():
-            if not (dialog.is_group or dialog.is_channel):
-                continue
+            if dialog.is_group or dialog.is_channel:
+                dialogs.append(dialog)
+        total = len(dialogs)
+        for idx, dialog in enumerate(dialogs, 1):
             entity = dialog.entity
             title = getattr(entity, 'title', None) or 'بدون اسم'
             username = getattr(entity, 'username', None)
@@ -374,9 +472,13 @@ async def export_group_links(client, phone, target_id=None):
                 link = f"https://t.me/{username}"
             else:
                 try:
-                    invite = await client(ExportChatInviteRequest(dialog.id))
+                    invite = await asyncio.wait_for(client(ExportChatInviteRequest(dialog.id)), timeout=10)
                     link = invite.link
+                except asyncio.TimeoutError:
+                    unavailable += 1
+                    link = "🔒 رابط غير متاح (انتهت مهلة الاستخراج)"
                 except Exception:
+                    unavailable += 1
                     link = "🔒 رابط غير متاح (قروب خاص ولست مشرفاً فيه)"
             count += 1
             lines.append(f"{count}. {title}")
@@ -384,16 +486,22 @@ async def export_group_links(client, phone, target_id=None):
             if members:
                 lines.append(f"   الأعضاء: {members}")
             lines.append("")
-        
+            # تحديث رسالة الحالة كل 5 قروبات (تغذية راجعة حية)
+            if status_msg is not None and idx % 5 == 0:
+                try:
+                    await status_msg.edit(f"⏳ جاري جمع الروابط... {idx}/{total} قروب")
+                except Exception:
+                    pass
+
         if count == 0:
             try:
                 await bot.send_message(target_id, f"⚠️ الحساب `{phone}` ليس عضواً في أي قروبات أو قنوات.")
             except Exception:
                 pass
             return
-        
+
         safe_phone = str(phone).replace('+', '').replace(':', '').replace('/', '_')
-        file_path = f"group_links_{safe_phone}.txt"
+        file_path = os.path.join(DATA_DIR, f"group_links_{safe_phone}.txt")
         with open(file_path, 'w', encoding='utf-8') as f:
             f.write("\n".join(lines))
         try:
@@ -401,15 +509,131 @@ async def export_group_links(client, phone, target_id=None):
                 target_id,
                 file_path,
                 caption=(f"📋 **روابط قروبات الحساب** `{phone}`\n"
-                         f"📊 عدد القروبات/القنوات: **{count}**\n\n"
+                         f"📊 عدد القروبات/القنوات: **{count}**\n"
+                         f"🔒 روابط غير متاحة: {unavailable}\n\n"
                          f"🔗 الروابط العامة + الخاصة (التي يستطيع الحساب استخراجها)")
             )
             logger.info(f"📋 تم إرسال تقرير روابط القروبات ({count} قروب) للحساب {phone} → {target_id}")
-        finally:
-            if os.path.exists(file_path):
-                os.remove(file_path)
+        except Exception as send_err:
+            # بديل نصي إذا فشل إرسال الملف — لا يبقى الطالب بلا جواب
+            logger.error(f"فشل إرسال ملف الروابط: {send_err} — جاري الإرسال نصياً")
+            body = "\n".join(lines)
+            for start in range(0, len(body), 3500):
+                await bot.send_message(target_id, body[start:start + 3500])
+                await asyncio.sleep(0.2)
     except Exception as e:
         logger.error(f"خطأ في تصدير روابط قروبات الحساب {phone}: {e}")
+        # إشعار مضمون بالفشل — المستخدم لن يبقى منتظراً بلا جواب
+        try:
+            await bot.send_message(
+                target_id,
+                f"❌ فشل جمع تقرير روابط الحساب `{phone}`.\n"
+                f"السبب: `{str(e)[:150]}`\n\n"
+                f"💡 جرّب مرة أخرى، وإن تكرر فأعد إضافة الحساب."
+            )
+        except Exception:
+            pass
+    finally:
+        try:
+            if file_path and os.path.exists(file_path):
+                os.remove(file_path)
+        except Exception:
+            pass
+
+# ============ سجلات الدردشة (تخزين + حذف تلقائي + إحصاءات) ============
+
+def log_chat_entry(phone, chat_id, chat_title, sender_id, sender_name, text, targets):
+    """تسجيل سطر في سجل الدردشة (jsonl) — يُحذف تلقائياً بعد مدة الاحتفاظ"""
+    try:
+        entry = {
+            'ts': time.time(),
+            'phone': phone,
+            'chat_id': chat_id,
+            'chat_title': chat_title,
+            'sender_id': sender_id,
+            'sender_name': sender_name or '',
+            'text': (text or '')[:2000],
+            'targets': targets,
+        }
+        with open(CHAT_LOG_FILE, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+    except Exception as e:
+        logger.error(f"خطأ في تسجيل سجل الدردشة: {e}")
+
+def get_logs_stats():
+    """إحصاءات السجلات: (عدد الأسطر، أقدم طابع زمني، الحجم بالبايت)"""
+    count, oldest, size = 0, None, 0
+    if os.path.exists(CHAT_LOG_FILE):
+        size = os.path.getsize(CHAT_LOG_FILE)
+        try:
+            with open(CHAT_LOG_FILE, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    count += 1
+                    if oldest is None:
+                        try:
+                            oldest = json.loads(line).get('ts')
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+    return count, oldest, size
+
+def fmt_size(nbytes):
+    """تنسيق حجم بالبايت لعرض مقروء"""
+    if nbytes >= 1048576:
+        return f"{nbytes / 1048576:.2f} ميجابايت"
+    if nbytes >= 1024:
+        return f"{nbytes / 1024:.1f} كيلوبايت"
+    return f"{nbytes} بايت"
+
+async def logs_cleanup_task():
+    """مهمة دورية: حذف سجلات الدردشة الأقدم من مدة الاحتفاظ (الافتراضي 3 أيام)
+    + تنظيف ذاكرة كشف التكرار وخريطة الرسائل ليبقى البوت سريعاً ومرناً"""
+    while True:
+        try:
+            config = load_json_config()
+            try:
+                days = max(1, int(config.get('LOG_RETENTION_DAYS', 3)))
+            except (TypeError, ValueError):
+                days = 3
+            cutoff = time.time() - days * 86400
+            removed = 0
+            if os.path.exists(CHAT_LOG_FILE):
+                kept_lines = []
+                with open(CHAT_LOG_FILE, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            ts = json.loads(line).get('ts', 0)
+                        except Exception:
+                            ts = 0
+                        if ts >= cutoff:
+                            kept_lines.append(line)
+                        else:
+                            removed += 1
+                if removed:
+                    tmp_file = CHAT_LOG_FILE + '.tmp'
+                    with open(tmp_file, 'w', encoding='utf-8') as f:
+                        f.write('\n'.join(kept_lines) + ('\n' if kept_lines else ''))
+                    os.replace(tmp_file, CHAT_LOG_FILE)
+                    logger.info(f"🗑 تم حذف {removed} سجل دردشة أقدم من {days} يوم/أيام (تنظيف تلقائي)")
+
+            # تنظيف ذاكرة الرسائل المعالجة — يمنع تضخم الذاكرة مع الوقت
+            now = time.time()
+            stale = [mid for mid, info in message_map.items() if now - info.get('timestamp', now) > 172800]
+            for mid in stale:
+                message_map.pop(mid, None)
+            if len(seen_messages) > 60000:
+                seen_messages.clear()
+                logger.info("🧹 تم تنظيف ذاكرة كشف التكرار (حماية من تضخم الذاكرة)")
+        except Exception as e:
+            logger.error(f"خطأ في مهمة تنظيف السجلات: {e}")
+        await asyncio.sleep(3600)
 
 # ============ الحذف التلقائي ============
 
@@ -665,6 +889,13 @@ async def process_message(event, client, phone):
             except Exception as fe:
                 logger.warning(f"⚠️ فشل إرسال النسخة للقروب المعتمد {gid}: {str(fe)[:100]}")
         
+        # ===== تسجيل سجل الدردشة (يُحذف تلقائياً بعد مدة الاحتفاظ) =====
+        log_targets = [CHANNEL_ID]
+        if admin_group:
+            log_targets.append(admin_group)
+        log_targets.extend(extra_targets)
+        log_chat_entry(phone, event.chat_id, chat_title, sender_id, sender_name, message_text, log_targets)
+        
         # ===== الرد التلقائي بالقروب =====
         auto_reply_settings = config.get('AUTO_REPLY_SETTINGS', {})
         for kw in matched_keywords:
@@ -784,6 +1015,8 @@ async def setup_bot_handlers():
             buttons.append([Button.inline('📢 إذاعة رسالة لجميع المستخدمين', b'broadcast_btn')])
         if is_main_admin(user_id):
             buttons.append([Button.inline('📤 قروب استقبال كل الرسائل', b'admingroup')])
+        if is_full_admin(user_id):
+            buttons.append([Button.inline('💾 السجلات والتخزين', b'logs_menu')])
         
         # ترحيب مخصص حسب نوع الأدمن
         if is_main_admin(user_id):
@@ -1019,9 +1252,11 @@ async def setup_bot_handlers():
             if phone in active_clients:
                 await active_clients[phone].disconnect()
                 del active_clients[phone]
-                if os.path.exists(f'session_{phone}.session'):
-                    os.remove(f'session_{phone}.session')
-                # تنظيف اعتمادات القروبات وملكية الحساب المحذوف
+                sess_path = os.path.join(SESSION_DIR, f'session_{phone}.session')
+                if os.path.exists(sess_path):
+                    os.remove(sess_path)
+                # إزالة الجلسة المحفوظة من config + تنظيف اعتمادات القروبات وملكية الحساب المحذوف
+                forget_session_string(phone)
                 try:
                     cfg_del = load_json_config()
                     ag_map = cfg_del.get('ACCOUNT_GROUPS', {})
@@ -1766,8 +2001,9 @@ async def setup_bot_handlers():
                 await event.respond("❌ الحساب غير موجود (ربما حُذف).")
                 return
             await event.answer("⏳ جاري جمع القروبات والروابط...")
-            status_msg = await event.respond(f"⏳ جاري جمع قروبات الحساب `{phone}` وروابطها... سيصلك الملف خلال لحظات.")
-            await export_group_links(active_clients[phone], phone, target_id=user_id)
+            status_msg = await event.respond(f"⏳ جاري جمع قروبات الحساب `{phone}` وروابطها... سيصلك الملف مباشرة خلال لحظات.")
+            # تشغيل غير حاجب — يضمن الاستجابة الفورية ويضمن وصول التقرير أو إشعار الفشل
+            asyncio.create_task(export_group_links(active_clients[phone], phone, target_id=user_id, status_msg=status_msg))
         
         elif data == b'unset_mygroup':
             if not is_main_admin(user_id):
@@ -1792,6 +2028,7 @@ async def setup_bot_handlers():
                 "💡 يمكنك أيضاً التعيين بإرسال `/mygroup` داخل القروب المطلوب.",
                 buttons=[
                     [Button.inline('✏️ تعيين بالمعرّف (ID)', b'set_admingroup_btn')],
+                    [Button.inline('📌 تعيين القروب الرسمي (hsjjjjihsjs)', b'set_official_group')],
                     [Button.inline('❌ إلغاء القروب', b'unset_mygroup')],
                     [Button.inline('🔙 رجوع', b'back_main')]
                 ]
@@ -1803,6 +2040,115 @@ async def setup_bot_handlers():
                 return
             login_states[user_id] = {'step': 'set_admingroup'}
             await event.respond("📝 أرسل **معرّف القروب** الرقمي (يبدأ عادةً بـ -100) أو @اسم القروب:")
+        
+        elif data == b'set_official_group':
+            if not is_main_admin(user_id):
+                await event.answer("🚫 للأدمن الرئيسي/الثابت فقط.", alert=True)
+                return
+            await event.answer("📌 جاري تعيين القروب الرسمي...")
+            try:
+                raw = OFFICIAL_GROUP.replace('https://t.me/', '@').replace('t.me/', '@').strip()
+                entity = await bot.get_entity(raw)
+                og_id = int(entity.chat_id if hasattr(entity, 'chat_id') and entity.chat_id else entity.id)
+                title = getattr(entity, 'title', None) or str(og_id)
+                config['ADMIN_GROUP_ID'] = og_id
+                update_json_config(config)
+                await event.respond(
+                    f"✅ تم تعيين **القروب الرسمي لاستقبال كل الرسائل**!\n\n"
+                    f"📤 القروب: {title} (`{og_id}`)\n"
+                    f"📨 ستصله نسخة من كل رسالة تُوجّه من أي مشترك بالبوت."
+                )
+                logger.info(f"📌 تم تعيين القروب الرسمي: {og_id} ({title}) بواسطة {user_id}")
+            except Exception as e:
+                await event.respond(
+                    f"❌ تعذر تعيين القروب الرسمي ({OFFICIAL_GROUP}).\n\n"
+                    f"⚠️ تأكد أن البوت **عضو في القروب** أولاً ثم أعد المحاولة.\n"
+                    f"تفاصيل: {str(e)[:120]}"
+                )
+        
+        # ============ السجلات والتخزين (للأدمن) ============
+        
+        elif data == b'logs_menu':
+            if not is_full_admin(user_id):
+                await event.answer("🚫 للأدمن فقط.", alert=True)
+                return
+            count, oldest, size = get_logs_stats()
+            try:
+                days = max(1, int(config.get('LOG_RETENTION_DAYS', 3)))
+            except (TypeError, ValueError):
+                days = 3
+            try:
+                disk = shutil.disk_usage(DATA_DIR)
+                disk_line = f"💽 **مساحة التخزين:** {fmt_size(disk.used)} مستخدمة من {fmt_size(disk.total)} (المتاح: {fmt_size(disk.free)})\n"
+            except Exception:
+                disk_line = ""
+            oldest_str = time.strftime('%Y-%m-%d %H:%M', time.localtime(oldest)) if oldest else '—'
+            msg = (
+                "💾 **السجلات والتخزين**\n\n"
+                f"📝 سجلات الدردشة الموجهة: **{count}** رسالة\n"
+                f"📦 حجم ملف السجلات: **{fmt_size(size)}**\n"
+                f"🕐 أقدم سجل: **{oldest_str}**\n"
+                f"⏱ الحذف التلقائي: **كل {days} يوم/أيام**\n"
+                f"{disk_line}\n"
+                "💡 تُحذف سجلات الدردشة تلقائياً بعد مدة الاحتفاظ حتى لا تمتلئ المساحة،\n"
+                "ويمكنك تعديل المدة أو حذف كل السجلات فوراً من الأزرار."
+            )
+            await event.respond(msg, buttons=[
+                [Button.inline('🗑 حذف كل السجلات الآن', b'confirm_logs')],
+                [Button.inline('⏱ تحديد مدة الحذف التلقائي', b'set_log_retention_btn')],
+                [Button.inline('🔙 رجوع', b'back_main')]
+            ])
+        
+        elif data == b'confirm_logs':
+            if not is_full_admin(user_id):
+                await event.answer("🚫 للأدمن فقط.", alert=True)
+                return
+            count, oldest, size = get_logs_stats()
+            await event.respond(
+                f"⚠️ **تأكيد الحذف**\n\n"
+                f"سيتم حذف **{count}** سجل دردشة ({fmt_size(size)}) نهائياً.\n"
+                f"هذا لا يؤثر على الرسائل في تيليجرام — فقط سجلات البوت المحلية.",
+                buttons=[
+                    [Button.inline('✅ نعم، احذف الآن', b'wipe_logs')],
+                    [Button.inline('❌ تراجع', b'logs_menu')]
+                ]
+            )
+        
+        elif data == b'wipe_logs':
+            if not is_full_admin(user_id):
+                await event.answer("🚫 للأدمن فقط.", alert=True)
+                return
+            freed = 0
+            try:
+                if os.path.exists(CHAT_LOG_FILE):
+                    freed = os.path.getsize(CHAT_LOG_FILE)
+                    os.remove(CHAT_LOG_FILE)
+                logger.info(f"🗑 الأدمن {user_id} حذف كل السجلات — تم تحرير {freed} بايت")
+            except Exception as e:
+                await event.respond(f"❌ خطأ في حذف السجلات: {str(e)[:100]}")
+                return
+            await event.respond(
+                f"✅ **تم حذف كل السجلات بنجاح!**\n\n"
+                f"💾 المساحة المحررة: **{fmt_size(freed)}**\n"
+                f"🧹 سجلات الدردشة الجديدة ستُحذف تلقائياً حسب المدة المحددة."
+            )
+        
+        elif data == b'set_log_retention_btn':
+            if not is_full_admin(user_id):
+                await event.answer("🚫 للأدمن فقط.", alert=True)
+                return
+            login_states[user_id] = {'step': 'set_log_retention'}
+            try:
+                days = max(1, int(config.get('LOG_RETENTION_DAYS', 3)))
+            except (TypeError, ValueError):
+                days = 3
+            await event.respond(
+                f"⏱ **مدة الحذف التلقائي للسجلات**\n\n"
+                f"المدة الحالية: **{days} يوم/أيام**\n\n"
+                f"📝 أرسل عدد الأيام التي تريد الاحتفاظ بسجلات الدردشة قبل حذفها تلقائياً\n"
+                f"(رقم بين 1 و 365 — مثال: `3`)\n\n"
+                f"💡 للإلغاء أرسل: `/cancel`"
+            )
         
         # ============ الإذاعة: نشر تحديثات وتنبيهات لجميع مستخدمي البوت ============
         
@@ -2256,7 +2602,7 @@ async def setup_bot_handlers():
         # إضافة حساب - رقم الهاتف
         elif state['step'] == 'await_phone':
             phone = text
-            new_client = TelegramClient(f'session_{phone}', API_ID, API_HASH)
+            new_client = TelegramClient(os.path.join(SESSION_DIR, f'session_{phone}'), API_ID, API_HASH, **CLIENT_OPTS)
             await new_client.connect()
             try:
                 sent_code = await new_client.send_code_request(phone)
@@ -2281,6 +2627,8 @@ async def setup_bot_handlers():
                 active_clients[state['phone']] = client
                 # ربط الحساب بمالكه (المستخدم الذي أضافه) — يتيح له إدارته لاحقاً
                 set_account_owner(state['phone'], state.get('owner') or user_id)
+                # 💾 حفظ الجلسة بشكل دائم (StringSession في config على الـ Volume) — لا تضيع مع إعادة النشر
+                save_session_string(state['phone'], client)
                 # تسجيل المعالج أولاً ثم بدء المراقبة
                 register_handler(client, state['phone'])
                 asyncio.create_task(start_monitoring(client, state['phone']))
@@ -2304,6 +2652,8 @@ async def setup_bot_handlers():
                 active_clients[state['phone']] = client
                 # ربط الحساب بمالكه (المستخدم الذي أضافه)
                 set_account_owner(state['phone'], state.get('owner') or user_id)
+                # 💾 حفظ الجلسة بشكل دائم (StringSession في config على الـ Volume)
+                save_session_string(state['phone'], client)
                 # تسجيل المعالج أولاً ثم بدء المراقبة
                 register_handler(client, state['phone'])
                 asyncio.create_task(start_monitoring(client, state['phone']))
@@ -2503,6 +2853,26 @@ async def setup_bot_handlers():
                 await event.respond("❌ من فضلك أرسل رقماً صحيحاً")
             del login_states[user_id]
 
+        # ============ مدة الاحتفاظ بسجلات الدردشة (الحذف التلقائي) ============
+        elif state['step'] == 'set_log_retention':
+            try:
+                days = int(text)
+                if 1 <= days <= 365:
+                    config['LOG_RETENTION_DAYS'] = days
+                    update_json_config(config)
+                    await event.respond(
+                        f"✅ تم التعيين: حذف سجلات الدردشة تلقائياً كل **{days} يوم/أيام**.\n\n"
+                        f"🗑 التنظيف يعمل تلقائياً كل ساعة — لن تمتلئ مساحة البوت."
+                    )
+                    logger.info(f"⏱ مدة الاحتفاظ بسجلات الدردشة أصبحت {days} يوم/أيام بواسطة {user_id}")
+                else:
+                    await event.respond("❌ أرسل رقماً بين 1 و 365 (أو `/cancel` للإلغاء)")
+                    return
+            except ValueError:
+                await event.respond("❌ من فضلك أرسل رقماً صحيحاً (أو `/cancel` للإلغاء)")
+                return
+            del login_states[user_id]
+
 async def main():
     global bot
     # تشغيل Flask أولاً - يجب أن يعمل حتى لو فشل Telegram
@@ -2541,9 +2911,8 @@ async def main():
     while retry_count < max_retries:
         try:
             logger.info(f"🔄 محاولة تشغيل البوت ({retry_count + 1}/{max_retries})...")
-            session_dir = os.path.dirname(os.path.abspath(__file__))
-            session_path = os.path.join(session_dir, 'bot_session')
-            bot = TelegramClient(session_path, API_ID, API_HASH)
+            session_path = os.path.join(SESSION_DIR, 'bot_session')
+            bot = TelegramClient(session_path, API_ID, API_HASH, **CLIENT_OPTS)
             await bot.start(bot_token=BOT_TOKEN)
             logger.info("✅ تم تشغيل البوت بنجاح!")
             break
@@ -2589,16 +2958,37 @@ async def main():
     logger.info(f"👑 الأدمن الرئيسي: {MAIN_ADMIN_ID}")
     logger.info(f"🛡 الأدمنة الثابتون (صلاحيات كاملة): {sorted(EXTRA_MAIN_ADMINS) or 'لا يوجد'}")
     logger.info(f"👥 المشرفون المضافون: {config.get('ADMINS', [])}")
+    logger.info(f"💾 مجلد البيانات الدائم: {DATA_DIR}")
     logger.info(f"🔒 البوت مخصص للمشرفين فقط — أي مستخدم غير مصرح له سيصله رسالة التواصل مع الأدمنة")
+
+    # ===== تعيين القروب الرسمي لاستقبال كل الرسائل تلقائياً (إن لم يُضبط قروب آخر) =====
+    config = load_json_config()
+    if not config.get('ADMIN_GROUP_ID'):
+        try:
+            raw = OFFICIAL_GROUP.replace('https://t.me/', '@').replace('t.me/', '@').strip()
+            entity = await bot.get_entity(raw)
+            og_id = int(entity.chat_id if hasattr(entity, 'chat_id') and entity.chat_id else entity.id)
+            config['ADMIN_GROUP_ID'] = og_id
+            update_json_config(config)
+            logger.info(f"📌 تم تعيين القروب الرسمي لاستقبال كل الرسائل: {getattr(entity, 'title', og_id)} ({og_id})")
+        except Exception as e:
+            logger.warning(
+                f"⚠️ تعذر تعيين القروب الرسمي ({OFFICIAL_GROUP}) تلقائياً: {str(e)[:120]} — "
+                f"أضف البوت إلى القروب ثم اضغط زر '📌 تعيين القروب الرسمي' من قروب استقبال كل الرسائل"
+            )
+    else:
+        logger.info(f"📤 قروب استقبال كل الرسائل: {config.get('ADMIN_GROUP_ID')}")
     
     await setup_bot_handlers()
     logger.info("✅ تم تسجيل معالجات البوت")
     
-    # بدء مهمة الحذف التلقائي
+    # بدء مهام الخلفية (الحذف التلقائي للقناة + تنظيف سجلات الدردشة)
     asyncio.create_task(auto_delete_task())
+    asyncio.create_task(logs_cleanup_task())
     
-    # استئناف الجلسات الموجودة
+    # استئناف الجلسات الموجودة (ملفات الجلسة على القرص الدائم)
     resumed_count = 0
+    session_dir = SESSION_DIR
     for f in os.listdir(session_dir):
         if f.startswith('session_') and f.endswith('.session') and f != 'bot_session.session':
             phone = f.replace('session_', '').replace('.session', '')
@@ -2608,7 +2998,7 @@ async def main():
                 continue
             try:
                 session_path = os.path.join(session_dir, f.replace('.session', ''))
-                client = TelegramClient(session_path, API_ID, API_HASH)
+                client = TelegramClient(session_path, API_ID, API_HASH, **CLIENT_OPTS)
                 await client.connect()
                 if await client.is_user_authorized():
                     active_clients[phone] = client
@@ -2621,6 +3011,27 @@ async def main():
                     logger.warning(f"الجلسة {phone} غير مصرحة.")
             except Exception as e:
                 logger.error(f"فشل استئناف الحساب {phone}: {e}")
+
+    # استعادة الحسابات من الجلسات المحفوظة (StringSession في config) إذا فُقدت ملفات الجلسة
+    try:
+        config = load_json_config()
+        saved_sessions = config.get('SESSIONS', {})
+        for phone, s in saved_sessions.items():
+            if phone in active_clients:
+                continue
+            if os.path.exists(os.path.join(SESSION_DIR, f'session_{phone}.session')):
+                continue  # سيُستأنف من الملف مباشرة
+            client = await resume_from_string(phone, s)
+            if client:
+                active_clients[phone] = client
+                register_handler(client, phone)
+                asyncio.create_task(start_monitoring(client, phone))
+                resumed_count += 1
+                logger.info(f"✅ تم استعادة الحساب {phone} من الجلسة المحفوظة دائماً (StringSession)")
+            else:
+                logger.warning(f"⚠️ تعذّر استعادة الحساب {phone} من الجلسة المحفوظة (ربما سجّل خروج من تيليجرام)")
+    except Exception as e:
+        logger.error(f"خطأ في استعادة الجلسات المحفوظة: {e}")
 
     logger.info(f"✅ البوت يعمل الآن - يراقب {resumed_count} حساب/حسابات - يراقب جميع المجموعات تلقائياً")
     logger.info("=" * 60)

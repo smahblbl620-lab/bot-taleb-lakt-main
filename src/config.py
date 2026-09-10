@@ -19,10 +19,28 @@ if CHANNEL_ID:
 SESSION_NAME = os.getenv('SESSION_NAME', 'telegram_monitor_session')
 
 # ============ إعدادات ملف JSON ============
-# استخدام نفس المجلد الذي يوجد فيه config.py لتخزين config.json
-# (نستخدم config.json مباشرة لأنه موجود في المستودع ويتم نسخه في Dockerfile)
+# مجلد البيانات الدائم: يُفضّل Railway Volume مثبت على /data (لا تفقد البيانات عند إعادة النشر)
+# إذا لم يوجد /data نستخدم مجلد config.py نفسه (سلوك قديم متوافق)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_FILE = os.path.join(BASE_DIR, 'config.json')
+DATA_DIR = os.getenv('DATA_DIR') or ('/data' if os.path.isdir('/data') and os.access('/data', os.W_OK) else BASE_DIR)
+try:
+    os.makedirs(DATA_DIR, exist_ok=True)
+except Exception:
+    DATA_DIR = BASE_DIR
+CONFIG_FILE = os.path.join(DATA_DIR, 'config.json')
+
+def _migrate_initial_config():
+    """ترحيل تلقائي عند أول تشغيل على Volume جديد: انسخ config.json القديم من مجلد الكود"""
+    try:
+        src = os.path.join(BASE_DIR, 'config.json')
+        if CONFIG_FILE != src and not os.path.exists(CONFIG_FILE) and os.path.exists(src):
+            import shutil
+            shutil.copy2(src, CONFIG_FILE)
+            print(f"✅ تم ترحيل config.json إلى مجلد البيانات الدائم: {DATA_DIR}")
+    except Exception as e:
+        print(f"⚠️ فشل ترحيل config.json: {e}")
+
+_migrate_initial_config()
 
 def load_json_config():
     """تحميل جميع الإعدادات من ملف JSON مع القيم الافتراضية"""
