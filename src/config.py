@@ -59,7 +59,8 @@ def load_json_config():
             "block_suspicious": False
         },
         "ADMIN_GROUP_ID": 0,
-        "ADMIN_PERMISSIONS": {}
+        "ADMIN_PERMISSIONS": {},
+        "MAX_ACCOUNTS_PER_USER": 3
     }
     
     if os.path.exists(CONFIG_FILE):

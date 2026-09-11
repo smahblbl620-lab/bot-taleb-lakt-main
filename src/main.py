@@ -1235,10 +1235,27 @@ async def setup_bot_handlers():
         # ============ إدارة الحسابات ============
         
         if data == b'add_acc':
+            # 🚧 حد الحسابات: كل مستخدم (عدا الأدمن الكامل/المالك) يضيف 3 حسابات كحد أقصى
+            max_acc = int(config.get('MAX_ACCOUNTS_PER_USER', 3) or 3)
+            owned_now = get_owned_accounts(user_id)
+            if not is_full_admin(user_id) and len(owned_now) >= max_acc:
+                accs_txt = ("`" + "`, `".join(owned_now[:6]) + "`") if owned_now else "—"
+                await event.respond(
+                    f"🚫 **وصلت إلى الحد الأقصى المسموح — {max_acc} حسابات فقط لكل مستخدم.**\n\n"
+                    f"📱 حساباتك الحالية ({len(owned_now)}): {accs_txt}\n\n"
+                    "💡 إذا أردت إضافة حسابات أكثر، **تواصل مع الأدمن أو المالك** لرفع الحد أو إضافة الحساب لك.\n"
+                    "🗑 أو احذف حساباً قديماً من ❌ حذف حسابي ثم أضف حساباً جديداً."
+                )
+                logger.info(f"🚧 المستخدم {user_id} وصل لحد الحسابات ({len(owned_now)}/{max_acc}) — مُنع من الإضافة")
+                return
             login_states[user_id] = {'step': 'await_phone', 'owner': user_id}
+            quota_line = ""
+            if not is_full_admin(user_id):
+                remaining = max_acc - len(owned_now)
+                quota_line = f"\n\n📊 حصتك: {len(owned_now)}/{max_acc} حسابات مستخدمة — يمكنك إضافة {remaining} أخرى."
             await event.respond(
                 "📱 من فضلك أرسل **رقم الهاتف** مع مفتاح الدولة (مثال: +9665xxxxxxxx):\n\n"
-                "💡 سيُربط الحساب بحسابك في البوت وتصلك رسائله الملتقطة."
+                "💡 سيُربط الحساب بحسابك في البوت وتصلك رسائله الملتقطة." + quota_line
             )
         
         elif data == b'list_acc':
