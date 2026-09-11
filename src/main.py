@@ -8,8 +8,8 @@ import shutil
 from telethon import TelegramClient, events, Button
 from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError
 from telethon.sessions import StringSession
-from telethon.tl.types import Chat, Channel
-from telethon.tl.functions.messages import ExportChatInviteRequest
+from telethon.tl.types import Chat, Channel, ChatInviteAlready
+from telethon.tl.functions.messages import ExportChatInviteRequest, CheckChatInviteRequest
 from flask import Flask
 from threading import Thread
 from config import API_ID, API_HASH, BOT_TOKEN, CHANNEL_ID, load_json_config, update_json_config, DATA_DIR
@@ -212,6 +212,81 @@ def get_owned_accounts(user_id):
     config = load_json_config()
     ow = config.get('ACCOUNT_OWNERS', {})
     return [phone for phone, owner in ow.items() if owner == user_id or str(owner) == str(user_id)]
+
+def get_user_fwd_groups(user_id, cfg=None):
+    """قروبات التوجيه المعتمدة لمستخدم محدد — العزل: تُعرض قروباته هو فقط"""
+    if cfg is None:
+        cfg = load_json_config()
+    gids = cfg.get('USER_GROUPS', {}).get(str(user_id), [])
+    title_map = {g.get('id'): g.get('title', g.get('id')) for g in cfg.get('FORWARD_GROUPS', [])}
+    return [{'id': gid, 'title': title_map.get(gid, str(gid))} for gid in gids]
+
+async def resolve_fwd_group(text_input):
+    """تحليل إدخال القروب (ID أو @username أو رابط t.me أو رابط دعوة خاص) → (gid, title, err)"""
+    raw = text_input.strip()
+    # 1) رابط دعوة خاص (t.me/+hash أو t.me/joinchat/hash)
+    m = re.match(r'^(?:https?://)?t\.me/(?:\+|joinchat/)([A-Za-z0-9_-]+)', raw)
+    if m:
+        try:
+            inv = await bot(CheckChatInviteRequest(m.group(1)))
+            if isinstance(inv, ChatInviteAlready):
+                chat = inv.chat
+                gid = int(getattr(chat, 'chat_id', None) or chat.id)
+                title = getattr(chat, 'title', None) or str(gid)
+                return gid, title, None
+            return None, None, "البوت ليس عضواً في هذا القروب الخاص — أضف البوت إلى القروب أولاً ثم أعد المحاولة."
+        except Exception as e:
+            return None, None, f"تعذر التحقق من رابط الدعوة: {str(e)[:100]} — أضف البوت إلى القروب أولاً."
+    # 2) معرّف رقمي
+    if re.match(r'^-?\d+$', raw):
+        try:
+            entity = await bot.get_entity(int(raw))
+            gid = int(entity.chat_id if hasattr(entity, 'chat_id') and entity.chat_id else entity.id)
+            title = getattr(entity, 'title', None) or str(gid)
+            return gid, title, None
+        except Exception:
+            # نقبل المعرّف حتى لو تعذّر جلب العنوان — قد يُضاف البوت إلى القروب لاحقاً
+            try:
+                return int(raw), str(raw), None
+            except ValueError:
+                return None, None, "معرّف رقمي غير صحيح."
+    # 3) @username أو رابط قروب عام
+    t_raw = raw.replace('https://t.me/', '@').replace('t.me/', '@').replace('telegram.me/', '@').strip()
+    try:
+        entity = await bot.get_entity(t_raw)
+        gid = int(entity.chat_id if hasattr(entity, 'chat_id') and entity.chat_id else entity.id)
+        title = getattr(entity, 'title', None) or str(gid)
+        return gid, title, None
+    except Exception as e:
+        return None, None, f"لم أتمكن من التعرف على القروب: {str(e)[:100]}"
+
+def build_myfwd_screen(user_id, cfg):
+    """شاشة (🎯 قروب توجيه رسائلي) — كل مستخدم يرى قروباته وحساباته هو فقط (عزل تام)"""
+    mine = get_user_fwd_groups(user_id, cfg)
+    owned = get_owned_accounts(user_id)
+    if owned:
+        acc_line = f"📱 حساباتك المراقبة: **{len(owned)}** — `" + "`, `".join(owned[:8]) + "`"
+    else:
+        acc_line = "📱 حساباتك المراقبة: لا يوجد — أضف حسابك أولاً من ➕ إضافة حسابي"
+    text = (
+        "🎯 **قروب توجيه رسائلي**\n\n"
+        "اعتمد هنا القروب الذي تريد أن تُوجَّه إليه نسخ رسائل حساباتك الملتقطة — بنفسك وبدون تدخل من الأدمن.\n"
+        "🔒 بياناتك وقروباتك تظهر لك أنت فقط، ويمكن لمستخدم آخر اعتماد نفس القروب لحسابه دون أي تداخل.\n\n"
+        f"{acc_line}\n"
+        f"📦 قروباتك المعتمدة: **{len(mine)}**\n\n"
+    )
+    rows = []
+    for g in mine:
+        gid = g['id']
+        rows.append([
+            Button.inline(f"🗑 إلغاء: {g.get('title', gid)}", f"myfwd_tgl_{gid}".encode()),
+            Button.inline('🧪 اختبار', f"myfwd_test_{gid}".encode()),
+        ])
+    if mine:
+        text += "اضغط 🗑 لإلغاء اعتماد القروب، وزر 🧪 اختبار للتأكد من وصول البوت إليه:"
+    rows.append([Button.inline('➕ اعتماد قروب جديد', b'myfwd_add')])
+    rows.append([Button.inline('🔙 رجوع', b'back_main')])
+    return text, rows
 
 def has_perm(user_id, perm):
     """فحص صلاحية مفصلة — الأدمن الكامل يملك جميع الصلاحيات دائماً"""
@@ -866,15 +941,17 @@ async def process_message(event, client, phone):
             except Exception as ae:
                 logger.warning(f"⚠️ فشل إرسال النسخة لقروب الأدمن الرئيسي: {str(ae)[:100]}")
         
-        # ===== النسخ لقروبات التوجيه المعتمدة (قروبات الحساب + قروبات المستخدمين المعتمدين) =====
-        # قروبات الحساب المراقب نفسه (ACCOUNT_GROUPS) + قروبات المشرفين/الأعضاء المعتمدين (USER_GROUPS)
+        # ===== النسخ لقروبات التوجيه المعتمدة (عزل تام بين المستخدمين) =====
+        # رسائل كل حساب تُوجَّه فقط إلى: قروبات الحساب المعتمدة (ACCOUNT_GROUPS) + قروبات مالك الحساب نفسه (USER_GROUPS[المالك])
+        # — رسائل مستخدم لا تصل أبداً إلى قروبات مستخدم آخر
         extra_targets = []
         try:
             for gid in config.get('ACCOUNT_GROUPS', {}).get(str(phone), []):
                 if gid not in extra_targets:
                     extra_targets.append(gid)
-            for gids in config.get('USER_GROUPS', {}).values():
-                for gid in gids:
+            owner_id = config.get('ACCOUNT_OWNERS', {}).get(str(phone))
+            if owner_id is not None:
+                for gid in config.get('USER_GROUPS', {}).get(str(owner_id), []):
                     if gid not in extra_targets:
                         extra_targets.append(gid)
         except Exception as me:
@@ -995,6 +1072,8 @@ async def setup_bot_handlers():
             buttons.append([Button.inline('➕ إضافة حسابي', b'add_acc')])
             if owned_accounts:
                 buttons.append([Button.inline('❌ حذف حسابي', b'rem_acc')])
+        # 🎯 اعتماد قروب التوجيه ذاتياً — متاح لكل مستخدم (بدون تدخل الأدمن) وبعزل تام بين المستخدمين
+        buttons.append([Button.inline('🎯 قروب توجيه رسائلي', b'myfwd')])
         if has_perm(user_id, 'view_stats') or owned_accounts:
             buttons.append([Button.inline('📋 الحسابات المرتبطة', b'list_acc')])
         if has_perm(user_id, 'manage_keywords'):
@@ -1007,8 +1086,8 @@ async def setup_bot_handlers():
             buttons.append([Button.inline('📨 الرد التلقائي', b'manage_auto_reply'), Button.inline('🔄 التكرار والحذف التلقائي', b'manage_advanced')])
         if has_perm(user_id, 'manage_groups') or has_perm(user_id, 'export_links'):
             buttons.append([Button.inline('👥 المجموعات وروابط القروبات', b'manage_groups')])
-        if has_perm(user_id, 'manage_groups'):
-            buttons.append([Button.inline('✅ اعتمادات قروبات التوجيه', b'approve_groups')])
+        if is_full_admin(user_id):
+            buttons.append([Button.inline('✅ اعتمادات قروبات الجميع (أدمن)', b'approve_groups')])
         if has_perm(user_id, 'add_admins'):
             buttons.append([Button.inline('👑 إدارة المشرفين والأعضاء', b'manage_admins')])
         if has_perm(user_id, 'broadcast'):
@@ -1029,7 +1108,9 @@ async def setup_bot_handlers():
             perms_desc = [desc for key, desc in PERMISSIONS.items() if has_perm(user_id, key)]
             welcome = (f"👋 **أهلاً بك!** — رتبتك: {role_label}\n\n🛠 الأزرار المتاحة لك (يحددها الأدمن):\n"
                        + ("\n".join([f"✅ {d}" for d in perms_desc])
-                          if perms_desc else "⚠️ لا توجد صلاحيات مفعلّة بعد — تواصل مع الأدمن الرئيسي."))
+                          if perms_desc else "⚠️ لا توجد صلاحيات مفعلّة بعد — تواصل مع الأدمن الرئيسي.")
+                       + "\n\n🎯 اعتمد **قروب توجيه رسائلك** بنفسك من زر (🎯 قروب توجيه رسائلي) دون تدخل أحد."
+                         "\n🔒 حساباتك وقروباتك وبياناتك تظهر لك أنت فقط — كل مستخدم منفصل تماماً عن غيره.")
         
         await event.respond(welcome, buttons=buttons)
 
@@ -1115,6 +1196,7 @@ async def setup_bot_handlers():
             'manage_auto_reply': 'manage_auto', 'add_auto_reply': 'manage_auto', 'rem_auto_reply': 'manage_auto',
             'manage_advanced': 'manage_auto', 'toggle_duplicate': 'manage_auto', 'set_auto_delete': 'manage_auto',
             'approve_groups': 'manage_groups', 'add_fwd_group_btn': 'manage_groups',
+            'add_group': 'manage_groups', 'rem_group': 'manage_groups',
             'broadcast_btn': 'broadcast',
         }
         CB_PERM_PREFIX = {
@@ -1162,7 +1244,8 @@ async def setup_bot_handlers():
         elif data == b'list_acc':
             if not active_clients:
                 await event.respond("❌ لا توجد حسابات مرتبطة حالياً.")
-            elif has_perm(user_id, 'view_stats'):
+            elif is_full_admin(user_id):
+                # 🔒 العزل: الأدمن الكامل فقط يرى كل الحسابات — العضو يرى حساباته هو فقط
                 ow = config.get('ACCOUNT_OWNERS', {})
                 lines = []
                 for p in active_clients.keys():
@@ -1213,11 +1296,17 @@ async def setup_bot_handlers():
             await event.respond(msg, buttons=buttons)
 
         elif data == b'refresh_groups':
-            if not active_clients:
-                await event.respond("❌ يجب ربط حساب واحد على الأقل للاستيراد.")
+            # 🔒 العزل: الأدمن الكامل يستورد من كل الحسابات — العضو من حساباته هو فقط
+            if is_full_admin(user_id):
+                scope = dict(active_clients)
+            else:
+                owned = get_owned_accounts(user_id)
+                scope = {p: c for p, c in active_clients.items() if p in owned}
+            if not scope:
+                await event.respond("❌ لا توجد حسابات يمكنك الاستيراد منها — أضف حسابك أولاً.")
             else:
                 total_new = 0
-                for phone, client in active_clients.items():
+                for phone, client in scope.items():
                     new = await import_groups(client)
                     total_new += new
                 await event.respond(f"✅ تم تحديث القائمة! تم استيراد `{total_new}` مجموعة جديدة.")
@@ -1228,7 +1317,7 @@ async def setup_bot_handlers():
             if not active_clients:
                 await event.respond("❌ لا توجد حسابات لحذفها.")
             else:
-                if has_perm(user_id, 'add_accounts'):
+                if is_full_admin(user_id):
                     deletable = list(active_clients.keys())
                     prompt = "🗑 اختر الحساب الذي تريد حذفه:"
                 else:
@@ -1245,7 +1334,7 @@ async def setup_bot_handlers():
         elif data.startswith(b'del_acc_'):
             phone = data.decode().replace('del_acc_', '')
             owner = config.get('ACCOUNT_OWNERS', {}).get(phone)
-            can_delete = has_perm(user_id, 'add_accounts') or owner == user_id or owner == str(user_id)
+            can_delete = is_full_admin(user_id) or owner == user_id or owner == str(user_id)
             if not can_delete:
                 await event.answer("🚫 يمكنك حذف حسابك فقط — تواصل مع الأدمن لحذف حسابات الآخرين.", alert=True)
                 return
@@ -1988,15 +2077,25 @@ async def setup_bot_handlers():
         # ============ تقرير روابط القروبات ============
         
         elif data == b'report_links':
-            if not active_clients:
-                await event.respond("❌ لا توجد حسابات مرتبطة.")
+            # 🔒 العزل: الأدمن الكامل يرى كل الحسابات — العضو يحصل على تقرير حساباته هو فقط
+            if is_full_admin(user_id):
+                scope = list(active_clients.keys())
             else:
-                rows = [[Button.inline(p, f"rlink_{p}".encode())] for p in active_clients.keys()]
+                owned = get_owned_accounts(user_id)
+                scope = [p for p in active_clients.keys() if p in owned]
+            if not scope:
+                await event.respond("❌ لا توجد حسابات مرتبطة بحسابك — أضف حسابك أولاً من ➕ إضافة حسابي.")
+            else:
+                rows = [[Button.inline(p, f"rlink_{p}".encode())] for p in scope]
                 rows.append([Button.inline('🔙 رجوع', b'manage_groups')])
                 await event.respond("📄 اختر الحساب لاستخراج تقرير روابط قروباته\n(سيصلك الملف هنا مباشرة):", buttons=rows)
         
         elif data.startswith(b'rlink_'):
             phone = data.decode()[6:]
+            # 🔒 العزل: لا يمكن استخراج تقرير حساب مستخدم آخر
+            if not is_full_admin(user_id) and phone not in get_owned_accounts(user_id):
+                await event.answer("🚫 يمكنك استخراج تقرير حساباتك أنت فقط.", alert=True)
+                return
             if phone not in active_clients:
                 await event.respond("❌ الحساب غير موجود (ربما حُذف).")
                 return
@@ -2169,8 +2268,10 @@ async def setup_bot_handlers():
         # ============ اعتمادات قروبات التوجيه للمشرفين والأعضاء ============
         
         elif data == b'approve_groups':
-            if not has_perm(user_id, 'manage_groups'):
-                await event.answer("🚫 لا تملك صلاحية اعتماد القروبات.", alert=True)
+            if not is_full_admin(user_id):
+                # 🔒 العزل: شاشة اعتمادات الجميع للأدمن الكامل فقط — العضو يدير قروباته هو فقط
+                text_mf, rows_mf = build_myfwd_screen(user_id, config)
+                await event.respond("🎯 إدارة قروبات باقي المستخدمين تحتاج رتبة أدمن.\n\nهذه شاشة قروباتك أنت:\n\n" + text_mf, buttons=rows_mf)
                 return
             users = config.get('ADMINS', [])
             fg = config.get('FORWARD_GROUPS', [])
@@ -2198,8 +2299,8 @@ async def setup_bot_handlers():
         # ============ اعتماد قروبات التوجيه لكل حساب مراقب مباشرة ============
 
         elif data == b'accsel_menu':
-            if not has_perm(user_id, 'manage_groups'):
-                await event.answer("🚫 لا تملك صلاحية اعتماد القروبات.", alert=True)
+            if not is_full_admin(user_id):
+                await event.answer("🚫 هذه الشاشة للأدمن — اعتمد قروبك من 🎯 قروب توجيه رسائلي.", alert=True)
                 return
             ag_map = config.get('ACCOUNT_GROUPS', {})
             if not active_clients:
@@ -2222,6 +2323,9 @@ async def setup_bot_handlers():
 
         elif data.startswith(b'accsel_'):
             phone = data.decode()[7:]
+            if not is_full_admin(user_id):
+                await event.answer("🚫 هذه الشاشة للأدمن — اعتمد قروبك من 🎯 قروب توجيه رسائلي.", alert=True)
+                return
             if not phone:
                 await event.respond("❌ بيانات غير صحيحة.")
                 return
@@ -2250,6 +2354,9 @@ async def setup_bot_handlers():
             except (ValueError, IndexError):
                 await event.answer("❌ بيانات غير صحيحة.", alert=True)
                 return
+            if not is_full_admin(user_id):
+                await event.answer("🚫 اعتمادات حسابات الآخرين للأدمن فقط — استخدم 🎯 قروب توجيه رسائلي.", alert=True)
+                return
             ag_map = config.get('ACCOUNT_GROUPS', {})
             lst = ag_map.get(phone, [])
             if gid in lst:
@@ -2277,6 +2384,9 @@ async def setup_bot_handlers():
                 pass
 
         elif data == b'delfwd_menu':
+            if not is_full_admin(user_id):
+                await event.answer("🚫 حذف القروبات من القائمة العامة للأدمن فقط.", alert=True)
+                return
             fg = config.get('FORWARD_GROUPS', [])
             if not fg:
                 await event.respond("❌ لا توجد قروبات في القائمة.")
@@ -2291,6 +2401,9 @@ async def setup_bot_handlers():
             except ValueError:
                 await event.answer("❌ بيانات غير صحيحة.", alert=True)
                 return
+            if not is_full_admin(user_id):
+                await event.answer("🚫 حذف القروبات من القائمة العامة للأدمن فقط.", alert=True)
+                return
             config['FORWARD_GROUPS'] = [g for g in config.get('FORWARD_GROUPS', []) if g.get('id') != gid]
             ug = config.get('USER_GROUPS', {})
             for uid_s in list(ug.keys()):
@@ -2302,6 +2415,9 @@ async def setup_bot_handlers():
         
         elif data.startswith(b'ugsel_'):
             uid_str = data.decode()[6:]
+            if not is_full_admin(user_id):
+                await event.answer("🚫 اعتمادات باقي المستخدمين للأدمن فقط — استخدم 🎯 قروب توجيه رسائلي.", alert=True)
+                return
             if not uid_str.isdigit():
                 await event.respond("❌ معرّف غير صحيح.")
                 return
@@ -2331,6 +2447,9 @@ async def setup_bot_handlers():
             except (ValueError, IndexError):
                 await event.answer("❌ بيانات غير صحيحة.", alert=True)
                 return
+            if not is_full_admin(user_id):
+                await event.answer("🚫 اعتمادات باقي المستخدمين للأدمن فقط — استخدم 🎯 قروب توجيه رسائلي.", alert=True)
+                return
             ug = config.get('USER_GROUPS', {})
             lst = ug.get(uid_str, [])
             if gid in lst:
@@ -2358,8 +2477,8 @@ async def setup_bot_handlers():
                 pass
         
         elif data == b'add_fwd_group_btn':
-            if not has_perm(user_id, 'manage_groups'):
-                await event.answer("🚫 لا تملك صلاحية اعتماد القروبات.", alert=True)
+            if not is_full_admin(user_id):
+                await event.answer("🚫 الإضافة للقائمة العامة للأدمن — اعتمد قروبك من 🎯 قروب توجيه رسائلي.", alert=True)
                 return
             login_states[user_id] = {'step': 'add_fwd_group'}
             await event.respond(
@@ -2370,6 +2489,68 @@ async def setup_bot_handlers():
                 "⚠️ يجب أن يكون البوت عضواً في القروب ليعمل التوجيه."
             )
         
+        # ============ 🎯 قروب توجيه رسائلي (خدمة ذاتية لكل مستخدم — عزل تام) ============
+
+        elif data == b'myfwd':
+            text_mf, rows_mf = build_myfwd_screen(user_id, config)
+            await event.respond(text_mf, buttons=rows_mf)
+
+        elif data == b'myfwd_add':
+            login_states[user_id] = {'step': 'my_add_group'}
+            await event.respond(
+                "📝 أرسل بيانات القروب الذي تريد توجيه رسائلك إليه بأحد الصيغ:\n\n"
+                "• رابط القروب (مثال: `https://t.me/mygroup`)\n"
+                "• اسم المستخدم العام (مثال: `@mygroup`)\n"
+                "• المعرّف الرقمي (مثال: `-1001234567890`)\n\n"
+                "⚠️ يجب أن يكون البوت **عضواً في القروب** ليصله التوجيه — أضفه أولاً إن لم يكن.\n"
+                "💡 يمكن لعدة مستخدمين اعتماد نفس القروب، وكل واحد يرى اعتماده هو فقط.\n"
+                "💡 للإلغاء أرسل: `/cancel`"
+            )
+
+        elif data.startswith(b'myfwd_tgl_'):
+            try:
+                gid = int(data.decode()[10:])
+            except ValueError:
+                await event.answer("❌ بيانات غير صحيحة.", alert=True)
+                return
+            ug = config.get('USER_GROUPS', {})
+            lst = ug.get(str(user_id), [])
+            if gid not in lst:
+                await event.answer("ℹ️ القروب غير معتمد لديك بالفعل.", alert=True)
+                return
+            lst.remove(gid)
+            ug[str(user_id)] = lst
+            config['USER_GROUPS'] = ug
+            update_json_config(config)
+            logger.info(f"🎯 المستخدم {user_id} ألغى اعتماد قروب التوجيه {gid}")
+            await event.answer("🗑 أُلغي الاعتماد — لن تصله رسائل حساباتك.")
+            text_mf, rows_mf = build_myfwd_screen(user_id, load_json_config())
+            try:
+                await event.edit(text_mf, buttons=rows_mf)
+            except Exception:
+                pass
+
+        elif data.startswith(b'myfwd_test_'):
+            try:
+                gid = int(data.decode()[11:])
+            except ValueError:
+                await event.answer("❌ بيانات غير صحيحة.", alert=True)
+                return
+            if gid not in config.get('USER_GROUPS', {}).get(str(user_id), []):
+                await event.answer("🚫 هذا القروب ليس ضمن قروباتك المعتمدة.", alert=True)
+                return
+            await event.answer("🧪 جاري إرسال رسالة اختبار...")
+            try:
+                await bot.send_message(gid, "🧪 **رسالة اختبار من بوت المراقبة**\n\n✅ إذا كنت ترى هذه الرسالة في هذا القروب فالتوجيه يعمل بنجاح.")
+                await event.respond(f"✅ تم إرسال رسالة الاختبار إلى القروب (`{gid}`) بنجاح — التوجيه يعمل!")
+            except Exception as te:
+                await event.respond(
+                    f"❌ فشل الإرسال إلى القروب (`{gid}`).\n\n"
+                    "⚠️ السبب الأكثر شيوعاً: البوت ليس عضواً في القروب أو لا يملك صلاحية الإرسال.\n"
+                    "💡 أضف البوت إلى القروب وامنحه صلاحية إرسال الرسائل ثم أعد الاختبار.\n"
+                    f"تفاصيل: {str(te)[:120]}"
+                )
+
         # إدارة باقي العناصر (إضافة/حذف يدوي للمجموعات والكلمات)
         elif data in [b'add_kw', b'rem_kw', b'add_ignore', b'rem_ignore', b'add_group', b'rem_group']:
             login_states[user_id] = {'step': data.decode()}
@@ -2597,6 +2778,42 @@ async def setup_bot_handlers():
                     f"• معرّف رقمي (مثال: `-1001234567890`)\n• @username أو رابط t.me\n\n"
                     f"تفاصيل الخطأ: {str(e)[:120]}"
                 )
+            del login_states[user_id]
+
+        # ===== 🎯 اعتماد قروب توجيه ذاتي من المستخدم (بدون تدخل الأدمن) =====
+        elif state['step'] == 'my_add_group':
+            gid, title, err = await resolve_fwd_group(text)
+            if gid is None:
+                await event.respond(
+                    f"❌ {err}\n\n"
+                    "⚠️ تأكد أن البوت عضو في القروب وأن الصيغة صحيحة:\n"
+                    "• رابط أو @username أو معرّف رقمي\n"
+                    "💡 أعد إرسال البيانات أو أرسل `/cancel` للإلغاء."
+                )
+                return  # نُبقي الحالة لإعادة المحاولة
+            fg = config.get('FORWARD_GROUPS', [])
+            already_fg = any(g.get('id') == gid for g in fg)
+            if not already_fg:
+                fg.append({'id': gid, 'title': title})
+                config['FORWARD_GROUPS'] = fg
+            ug = config.get('USER_GROUPS', {})
+            lst = ug.get(str(user_id), [])
+            re_added = gid in lst
+            if not re_added:
+                lst.append(gid)
+            ug[str(user_id)] = lst
+            config['USER_GROUPS'] = ug
+            update_json_config(config)
+            note = "ℹ️ كان معتمداً لديك بالفعل." if re_added else "✅ تم اعتماده لحسابك الآن."
+            shared_note = "" if already_fg else "\n📦 أُضيف أيضاً إلى القائمة العامة ليتيح لمستخدمين آخرين اعتماد نفس القروب."
+            await event.respond(
+                f"🎉 **تم اعتماد قروب التوجيه بنجاح — بنفسك وبدون تدخل الأدمن!**\n\n"
+                f"📦 القروب: {title} (`{gid}`)\n"
+                f"{note}{shared_note}\n\n"
+                "📨 نسخ رسائل حساباتك الملتقطة ستُوجَّه إلى هذا القروب.\n"
+                "🧪 جرّب زر 🧪 اختبار في شاشة (🎯 قروب توجيه رسائلي) — وإن فشل فأضف البوت إلى القروب."
+            )
+            logger.info(f"🎯 المستخدم {user_id} اعتمد قروب توجيه ذاتياً: {gid} ({title})")
             del login_states[user_id]
 
         # إضافة حساب - رقم الهاتف
