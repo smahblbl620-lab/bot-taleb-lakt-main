@@ -60,7 +60,10 @@ def load_json_config():
         },
         "ADMIN_GROUP_ID": 0,
         "ADMIN_PERMISSIONS": {},
-        "MAX_ACCOUNTS_PER_USER": 3
+        "MAX_ACCOUNTS_PER_USER": 3,
+        "USER_KEYWORDS": {},
+        "USER_DM_TEMPLATES": {},
+        "USER_GRP_TEMPLATES": {}
     }
     
     if os.path.exists(CONFIG_FILE):

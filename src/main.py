@@ -6,7 +6,7 @@ import re
 import time
 import shutil
 from telethon import TelegramClient, events, Button
-from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError
+from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, PhoneCodeExpiredError
 from telethon.sessions import StringSession
 from telethon.tl.types import Chat, Channel, ChatInviteAlready
 from telethon.tl.functions.messages import ExportChatInviteRequest, CheckChatInviteRequest
@@ -220,6 +220,50 @@ def get_user_fwd_groups(user_id, cfg=None):
     gids = cfg.get('USER_GROUPS', {}).get(str(user_id), [])
     title_map = {g.get('id'): g.get('title', g.get('id')) for g in cfg.get('FORWARD_GROUPS', [])}
     return [{'id': gid, 'title': title_map.get(gid, str(gid))} for gid in gids]
+
+def get_user_keywords(user_id, cfg=None):
+    """🔑 الكلمات المفتاحية الخاصة بمستخدم محدد — خصوصية تامة بين المستخدمين"""
+    if cfg is None:
+        cfg = load_json_config()
+    return cfg.get('USER_KEYWORDS', {}).get(str(user_id), [])
+
+def set_user_keywords(user_id, items, cfg=None):
+    """حفظ الكلمات المفتاحية الخاصة بمستخدم محدد"""
+    if cfg is None:
+        cfg = load_json_config()
+    maps = cfg.get('USER_KEYWORDS', {})
+    maps[str(user_id)] = items
+    cfg['USER_KEYWORDS'] = maps
+    update_json_config(cfg)
+
+def get_own_templates(user_id, kind, cfg=None):
+    """💬 القوالب الخاصة بمستخدم محدد (kind='DM' أو 'GRP') — كل مستخدم يرى قوالب هو فقط"""
+    if cfg is None:
+        cfg = load_json_config()
+    key = 'USER_DM_TEMPLATES' if kind == 'DM' else 'USER_GRP_TEMPLATES'
+    return cfg.get(key, {}).get(str(user_id), [])
+
+def set_own_templates(user_id, kind, items, cfg=None):
+    """حفظ القوالب الخاصة بمستخدم محدد"""
+    if cfg is None:
+        cfg = load_json_config()
+    key = 'USER_DM_TEMPLATES' if kind == 'DM' else 'USER_GRP_TEMPLATES'
+    maps = cfg.get(key, {})
+    maps[str(user_id)] = items
+    cfg[key] = maps
+    update_json_config(cfg)
+
+async def ensure_connected(client):
+    """🔌 إعادة الاتصال تلقائياً إذا انقطع العميل — يمنع خطأ Cannot send requests while disconnected"""
+    try:
+        if client is None:
+            return False
+        if not client.is_connected():
+            await client.connect()
+        return client.is_connected() and await client.is_user_authorized()
+    except Exception as e:
+        logger.warning(f"⚠️ فشل إعادة الاتصال: {str(e)[:80]}")
+        return False
 
 async def resolve_fwd_group(text_input):
     """تحليل إدخال القروب (ID أو @username أو رابط t.me أو رابط دعوة خاص) → (gid, title, err)"""
@@ -745,7 +789,10 @@ async def process_message(event, client, phone):
     """معالجة الرسالة الواردة من أي حساب مراقب"""
     global message_map, seen_messages, stats
     config = load_json_config()
-    keywords = config.get('KEYWORDS', [])
+    # 🔑 كلمات مفتاحية خاصة بمالك الحساب أولاً ثم الكلمات العامة الافتراضية (خصوصية بين المستخدمين)
+    _owner_id = config.get('ACCOUNT_OWNERS', {}).get(str(phone))
+    _my_kw = config.get('USER_KEYWORDS', {}).get(str(_owner_id), []) if _owner_id is not None else []
+    keywords = list(dict.fromkeys(_my_kw + config.get('KEYWORDS', [])))
     ignore_users = config.get('IGNORE_USERS', [])
     
     # تجاهل الرسائل الخاصة (DM) - نراقب فقط القروبات والقنوات
@@ -893,16 +940,12 @@ async def process_message(event, client, phone):
         # ===== أزرار الرد المنفصلة + زر إضافة رد مباشر =====
         all_buttons = []
         
-        # صف أزرار الرد (خاص + قروب)
-        reply_row = []
-        dm_templates = config.get('DM_REPLY_TEMPLATES', [])
-        if dm_templates:
-            reply_row.append(Button.inline("💬 رد خاص", f"dm_reply_{event.chat_id}_{event.id}_{sender_id}".encode()))
-        grp_templates = config.get('GROUP_REPLY_TEMPLATES', [])
-        if grp_templates:
-            reply_row.append(Button.inline("👥 رد قروب", f"grp_reply_{event.chat_id}_{event.id}_{sender_id}".encode()))
-        if reply_row:
-            all_buttons.append(reply_row)
+        # صف أزرار الرد (خاص + قروب) — متاح دائماً: كل مستخدم يرد بقوالبه الخاصة هو
+        reply_row = [
+            Button.inline("💬 رد خاص", f"dm_reply_{event.chat_id}_{event.id}_{sender_id}".encode()),
+            Button.inline("👥 رد قروب", f"grp_reply_{event.chat_id}_{event.id}_{sender_id}".encode()),
+        ]
+        all_buttons.append(reply_row)
         
         # صف زر إضافة رد مباشر من القناة
         add_reply_row = [
@@ -978,11 +1021,15 @@ async def process_message(event, client, phone):
         for kw in matched_keywords:
             if kw in auto_reply_settings:
                 try:
-                    await client.send_message(
-                        event.chat_id,
-                        auto_reply_settings[kw],
-                        reply_to=event.id
-                    )
+                    # 🔌 التأكد من الاتصال قبل الإرسال — يمنع خطأ Cannot send requests while disconnected
+                    if await ensure_connected(client):
+                        await client.send_message(
+                            event.chat_id,
+                            auto_reply_settings[kw],
+                            reply_to=event.id
+                        )
+                    else:
+                        logger.warning(f"⚠️ تعذر إرسال الرد التلقائي — الحساب {phone} غير متصل")
                     logger.info(f"تم إرسال رد تلقائي للكلمة '{kw}' في القروب")
                 except Exception as e:
                     logger.error(f"خطأ في إرسال الرد التلقائي: {e}")
@@ -1076,12 +1123,13 @@ async def setup_bot_handlers():
         buttons.append([Button.inline('🎯 قروب توجيه رسائلي', b'myfwd')])
         if has_perm(user_id, 'view_stats') or owned_accounts:
             buttons.append([Button.inline('📋 الحسابات المرتبطة', b'list_acc')])
-        if has_perm(user_id, 'manage_keywords'):
-            buttons.append([Button.inline('🔑 الكلمات المفتاحية', b'manage_kw'), Button.inline('🚫 قائمة التجاهل', b'manage_ignore')])
+        # 🔑💬 خصوصية لكل مستخدم: كلماته المفتاحية وردوده الخاصة به هو فقط — يضيفها بنفسه
+        buttons.append([Button.inline('🔑 كلماتي المفتاحية', b'manage_kw'), Button.inline('💬 ردودي على الخاص', b'manage_dm_templates')])
+        buttons.append([Button.inline('👥 ردودي في القروب', b'manage_grp_templates')])
+        if is_full_admin(user_id):
+            buttons.append([Button.inline('🚫 قائمة التجاهل', b'manage_ignore')])
         if has_perm(user_id, 'manage_filters'):
             buttons.append([Button.inline('🛡️ كلمات محظورة ومشبوهة', b'manage_banned'), Button.inline('⚙️ إعدادات الفلترة', b'manage_filters')])
-        if has_perm(user_id, 'manage_templates'):
-            buttons.append([Button.inline('💬 قوالب الرد على الخاص', b'manage_dm_templates'), Button.inline('👥 قوالب الرد في القروب', b'manage_grp_templates')])
         if has_perm(user_id, 'manage_auto'):
             buttons.append([Button.inline('📨 الرد التلقائي', b'manage_auto_reply'), Button.inline('🔄 التكرار والحذف التلقائي', b'manage_advanced')])
         if has_perm(user_id, 'manage_groups') or has_perm(user_id, 'export_links'):
@@ -1185,7 +1233,6 @@ async def setup_bot_handlers():
         # ===== بوابة الصلاحيات المفصلة (كل زر مرتبط بصلاحية محددة — الأدمن يتحكم بها) =====
         data_str = data.decode('utf-8', errors='ignore')
         CB_PERM_MAP = {
-            'manage_kw': 'manage_keywords', 'add_kw': 'manage_keywords', 'rem_kw': 'manage_keywords',
             'manage_ignore': 'manage_keywords', 'add_ignore': 'manage_keywords', 'rem_ignore': 'manage_keywords',
             'manage_banned': 'manage_filters', 'add_banned_ad': 'manage_filters', 'rem_banned_ad': 'manage_filters',
             'manage_filters': 'manage_filters', 'set_max_length': 'manage_filters', 'reset_filters': 'manage_filters',
@@ -1281,10 +1328,58 @@ async def setup_bot_handlers():
         # ============ إدارة الكلمات المفتاحية ============
         
         elif data == b'manage_kw':
-            kw_list = config.get('KEYWORDS', [])
-            msg = "🔑 **الكلمات المفتاحية الحالية:**\n" + ("\n".join([f"- `{k}`" for k in kw_list]) if kw_list else "لا توجد كلمات.")
-            buttons = [[Button.inline('➕ إضافة', b'add_kw'), Button.inline('➖ حذف', b'rem_kw')], [Button.inline('🔙 رجوع', b'back_main')]]
-            await event.respond(msg, buttons=buttons)
+            # 🔒 خصوصية: كل مستخدم يضيف ويدير كلماته بنفسه — ولا تظهر لكلمات المستخدم الآخر
+            my_kw = get_user_keywords(user_id, config)
+            msg = ("🔑 **كلماتك المفتاحية الخاصة**\n\n"
+                   "رسائل حساباتك تُلتقط عندما يحتوي نصها على إحدى كلماتك.\n\n")
+            if my_kw:
+                for i, k in enumerate(my_kw, 1):
+                    msg += f"{i}. `{k}`\n"
+            else:
+                msg += "لا توجد كلمات بعد — أضف كلمتك الأولى من ➕ إضافة كلمة."
+            if is_full_admin(user_id):
+                gkw = config.get('KEYWORDS', [])
+                msg += f"\n🌍 كلمات عامة افتراضية (أدمن): **{len(gkw)}**" + ((" — `" + "`, `".join(gkw[:10]) + "`") if gkw else "")
+            await event.respond(msg, buttons=[
+                [Button.inline('➕ إضافة كلمة', b'add_kw'), Button.inline('🗑 حذف كلمة', b'rem_kw')],
+                [Button.inline('🔙 رجوع', b'back_main')],
+            ])
+
+        elif data == b'add_kw':
+            login_states[user_id] = {'step': 'add_kw'}
+            await event.respond(
+                "📝 أرسل الكلمة المفتاحية التي تريد إضافتها لقائمتك الخاصة:\n\n"
+                "💡 عندما تحتوي رسالة على هذه الكلمة تُلتقط وتُوجّه لقروبك.\n"
+                "💡 للإلغاء أرسل: `/cancel`"
+            )
+
+        elif data == b'rem_kw':
+            # 🗑 حذف الكلمات بالأزرار — اضغط الكلمة تُحذف فوراً (بدون كتابة اسمها)
+            my_kw = get_user_keywords(user_id, config)
+            if not my_kw:
+                await event.respond("❌ لا توجد كلمات خاصة بك لحذفها — أضف كلمة أولاً من ➕ إضافة كلمة.")
+            else:
+                rows = []
+                for i, k in enumerate(my_kw[:40]):
+                    preview = k[:25] + "..." if len(k) > 25 else k
+                    rows.append([Button.inline(f"🗑 {preview}", f"delkw_{i}".encode())])
+                rows.append([Button.inline('🔙 رجوع', b'manage_kw')])
+                await event.respond("🗑 **اضغط على الكلمة لحذفها فوراً:**", buttons=rows)
+
+        elif data.startswith(b'delkw_'):
+            try:
+                idx = int(data.decode()[6:])
+            except ValueError:
+                await event.answer("❌ بيانات غير صحيحة.", alert=True)
+                return
+            my_kw = get_user_keywords(user_id, config)
+            if 0 <= idx < len(my_kw):
+                removed = my_kw.pop(idx)
+                set_user_keywords(user_id, my_kw, config)
+                await event.answer(f"🗑 حُذفت: {removed[:30]}")
+                logger.info(f"🔑 المستخدم {user_id} حذف كلمته المفتاحية: {removed}")
+            else:
+                await event.answer("❌ الكلمة غير موجودة — حدّث القائمة.", alert=True)
 
         # ============ إدارة قائمة التجاهل ============
         
@@ -1530,45 +1625,49 @@ async def setup_bot_handlers():
         # ============ قوالب الرد على الخاص ============
         
         elif data == b'manage_dm_templates':
-            dm_templates = config.get('DM_REPLY_TEMPLATES', [])
-            msg = "💬 **قوالب الرد على الخاص**\n\n"
+            # 🔒 خصوصية: قوالبك الخاصة تظهر لك أنت فقط — ولا يراها أي مستخدم آخر
+            dm_templates = get_own_templates(user_id, 'DM', config)
+            msg = ("💬 **ردودك الخاصة على الخاص**\n\n"
+                   "هذه القوالب تُرسل من حسابك كرد خاص — تظهر لك أنت فقط ولا يراها غيرك.\n\n")
             if dm_templates:
                 for i, t in enumerate(dm_templates, 1):
                     preview = t[:50] + "..." if len(t) > 50 else t
                     msg += f"{i}. `{preview}`\n"
             else:
-                msg += "لا توجد قوالب حالياً."
-            
+                msg += "لا توجد قوالب خاصة بعد — أضف أول قالب من ➕ إضافة قالب."
             buttons = [
                 [Button.inline('➕ إضافة قالب', b'add_dm_template')],
-                [Button.inline('➖ حذف قالب', b'rem_dm_template')],
-                [Button.inline('🔙 رجوع', b'back_main')]
+                [Button.inline('🗑 حذف قالب', b'rem_dm_template')],
             ]
+            if is_full_admin(user_id):
+                gcnt = len(config.get('DM_REPLY_TEMPLATES', []))
+                msg += f"\n🌍 قوالب عامة افتراضية (للجميع): **{gcnt}**"
+                buttons.append([Button.inline('🌍 إدارة القوالب العامة (أدمن)', b'manage_gdm_templates')])
+            buttons.append([Button.inline('🔙 رجوع', b'back_main')])
             await event.respond(msg, buttons=buttons)
         
         elif data == b'add_dm_template':
             login_states[user_id] = {'step': 'add_dm_template'}
-            await event.respond("📝 أرسل نص قالب الرد على الخاص:\n\n(سيتم إرسال هذا النص كرسالة خاصة للمرسل عند اختيار هذا القالب)")
+            await event.respond("📝 أرسل نص قالب ردك **الخاص** على الخاص:\n\n(يُحفظ في قوالبك أنت فقط — سيُرسل كرسالة خاصة للمرسل عند اختيار هذا القالب)")
         
         elif data == b'rem_dm_template':
-            dm_templates = config.get('DM_REPLY_TEMPLATES', [])
+            dm_templates = get_own_templates(user_id, 'DM', config)
             if not dm_templates:
-                await event.respond("❌ لا توجد قوالب لحذفها.")
+                await event.respond("❌ لا توجد قوالب خاصة بك لحذفها.")
             else:
                 buttons = []
                 for i, t in enumerate(dm_templates):
                     preview = t[:30] + "..." if len(t) > 30 else t
                     buttons.append([Button.inline(f"🗑 {preview}", f"del_dm_tpl_{i}".encode())])
                 buttons.append([Button.inline('🔙 رجوع', b'manage_dm_templates')])
-                await event.respond("اختر القالب الذي تريد حذفه:", buttons=buttons)
+                await event.respond("اختر القالب الخاص الذي تريد حذفه:", buttons=buttons)
         
         elif data.startswith(b'del_dm_tpl_'):
             idx = int(data.decode().replace('del_dm_tpl_', ''))
-            dm_templates = config.get('DM_REPLY_TEMPLATES', [])
+            dm_templates = get_own_templates(user_id, 'DM', config)
             if 0 <= idx < len(dm_templates):
                 removed = dm_templates.pop(idx)
-                config['DM_REPLY_TEMPLATES'] = dm_templates
-                update_json_config(config)
+                set_own_templates(user_id, 'DM', dm_templates, config)
                 preview = removed[:40] + "..." if len(removed) > 40 else removed
                 await event.respond(f"✅ تم حذف القالب: `{preview}`")
             else:
@@ -1577,47 +1676,147 @@ async def setup_bot_handlers():
         # ============ قوالب الرد في القروب ============
         
         elif data == b'manage_grp_templates':
-            grp_templates = config.get('GROUP_REPLY_TEMPLATES', [])
-            msg = "👥 **قوالب الرد في القروب**\n\n"
+            # 🔒 خصوصية: قوالبك الخاصة تظهر لك أنت فقط — ولا يراها أي مستخدم آخر
+            grp_templates = get_own_templates(user_id, 'GRP', config)
+            msg = ("👥 **ردودك الخاصة في القروب**\n\n"
+                   "هذه القوالب تُرسل من حسابك كرد في القروب — تظهر لك أنت فقط ولا يراها غيرك.\n\n")
             if grp_templates:
                 for i, t in enumerate(grp_templates, 1):
                     preview = t[:50] + "..." if len(t) > 50 else t
                     msg += f"{i}. `{preview}`\n"
             else:
-                msg += "لا توجد قوالب حالياً."
-            
+                msg += "لا توجد قوالب خاصة بعد — أضف أول قالب من ➕ إضافة قالب."
             buttons = [
                 [Button.inline('➕ إضافة قالب', b'add_grp_template')],
-                [Button.inline('➖ حذف قالب', b'rem_grp_template')],
-                [Button.inline('🔙 رجوع', b'back_main')]
+                [Button.inline('🗑 حذف قالب', b'rem_grp_template')],
             ]
+            if is_full_admin(user_id):
+                gcnt = len(config.get('GROUP_REPLY_TEMPLATES', []))
+                msg += f"\n🌍 قوالب عامة افتراضية (للجميع): **{gcnt}**"
+                buttons.append([Button.inline('🌍 إدارة القوالب العامة (أدمن)', b'manage_ggrp_templates')])
+            buttons.append([Button.inline('🔙 رجوع', b'back_main')])
             await event.respond(msg, buttons=buttons)
         
         elif data == b'add_grp_template':
             login_states[user_id] = {'step': 'add_grp_template'}
-            await event.respond("📝 أرسل نص قالب الرد في القروب:\n\n(سيتم إرسال هذا النص كرد في القروب على رسالة المرسل عند اختيار هذا القالب)")
+            await event.respond("📝 أرسل نص قالب ردك **الخاص** في القروب:\n\n(يُحفظ في قوالبك أنت فقط — سيُرسل كرد في القروب عند اختيار هذا القالب)")
         
         elif data == b'rem_grp_template':
-            grp_templates = config.get('GROUP_REPLY_TEMPLATES', [])
+            grp_templates = get_own_templates(user_id, 'GRP', config)
             if not grp_templates:
-                await event.respond("❌ لا توجد قوالب لحذفها.")
+                await event.respond("❌ لا توجد قوالب خاصة بك لحذفها.")
             else:
                 buttons = []
                 for i, t in enumerate(grp_templates):
                     preview = t[:30] + "..." if len(t) > 30 else t
                     buttons.append([Button.inline(f"🗑 {preview}", f"del_grp_tpl_{i}".encode())])
                 buttons.append([Button.inline('🔙 رجوع', b'manage_grp_templates')])
-                await event.respond("اختر القالب الذي تريد حذفه:", buttons=buttons)
+                await event.respond("اختر القالب الخاص الذي تريد حذفه:", buttons=buttons)
         
         elif data.startswith(b'del_grp_tpl_'):
             idx = int(data.decode().replace('del_grp_tpl_', ''))
-            grp_templates = config.get('GROUP_REPLY_TEMPLATES', [])
+            grp_templates = get_own_templates(user_id, 'GRP', config)
             if 0 <= idx < len(grp_templates):
                 removed = grp_templates.pop(idx)
-                config['GROUP_REPLY_TEMPLATES'] = grp_templates
-                update_json_config(config)
+                set_own_templates(user_id, 'GRP', grp_templates, config)
                 preview = removed[:40] + "..." if len(removed) > 40 else removed
                 await event.respond(f"✅ تم حذف القالب: `{preview}`")
+            else:
+                await event.respond("❌ القالب غير موجود.")
+        
+        # ============ القوالب العامة الافتراضية (أدمن فقط — تظهر للجميع كخيار إضافي) ============
+        
+        elif data == b'manage_gdm_templates':
+            if not is_full_admin(user_id):
+                await event.answer("🚫 للأدمن فقط.", alert=True)
+                return
+            g_tpl = config.get('DM_REPLY_TEMPLATES', [])
+            msg = ("🌍 **القوالب العامة — الرد على الخاص**\n\n"
+                   "تظهر لكل المستخدمين كخيار إضافي بعد قوالبهم الخاصة.\n\n")
+            msg += "\n".join([f"{i}. `{(t[:50] + '...') if len(t) > 50 else t}`" for i, t in enumerate(g_tpl, 1)]) if g_tpl else "لا توجد قوالب عامة."
+            await event.respond(msg, buttons=[
+                [Button.inline('➕ إضافة قالب عام', b'add_gdm_template')],
+                [Button.inline('🗑 حذف قالب عام', b'rem_gdm_template')],
+                [Button.inline('🔙 رجوع', b'manage_dm_templates')],
+            ])
+        
+        elif data == b'add_gdm_template':
+            if not is_full_admin(user_id):
+                await event.answer("🚫 للأدمن فقط.", alert=True)
+                return
+            login_states[user_id] = {'step': 'add_gdm_template'}
+            await event.respond("📝 أرسل نص القالب العام للرد على الخاص (سيظهر لجميع المستخدمين):")
+        
+        elif data == b'rem_gdm_template':
+            if not is_full_admin(user_id):
+                await event.answer("🚫 للأدمن فقط.", alert=True)
+                return
+            g_tpl = config.get('DM_REPLY_TEMPLATES', [])
+            if not g_tpl:
+                await event.respond("❌ لا توجد قوالب عامة لحذفها.")
+            else:
+                rows = [[Button.inline(f"🗑 {(t[:30] + '...') if len(t) > 30 else t}", f"gdel_dm_tpl_{i}".encode())] for i, t in enumerate(g_tpl)]
+                rows.append([Button.inline('🔙 رجوع', b'manage_gdm_templates')])
+                await event.respond("اختر القالب العام الذي تريد حذفه:", buttons=rows)
+        
+        elif data.startswith(b'gdel_dm_tpl_'):
+            if not is_full_admin(user_id):
+                await event.answer("🚫 للأدمن فقط.", alert=True)
+                return
+            idx = int(data.decode().replace('gdel_dm_tpl_', ''))
+            g_tpl = config.get('DM_REPLY_TEMPLATES', [])
+            if 0 <= idx < len(g_tpl):
+                removed = g_tpl.pop(idx)
+                config['DM_REPLY_TEMPLATES'] = g_tpl
+                update_json_config(config)
+                await event.respond(f"✅ تم حذف القالب العام: `{removed[:40]}`")
+            else:
+                await event.respond("❌ القالب غير موجود.")
+        
+        elif data == b'manage_ggrp_templates':
+            if not is_full_admin(user_id):
+                await event.answer("🚫 للأدمن فقط.", alert=True)
+                return
+            g_tpl = config.get('GROUP_REPLY_TEMPLATES', [])
+            msg = ("🌍 **القوالب العامة — الرد في القروب**\n\n"
+                   "تظهر لكل المستخدمين كخيار إضافي بعد قوالبهم الخاصة.\n\n")
+            msg += "\n".join([f"{i}. `{(t[:50] + '...') if len(t) > 50 else t}`" for i, t in enumerate(g_tpl, 1)]) if g_tpl else "لا توجد قوالب عامة."
+            await event.respond(msg, buttons=[
+                [Button.inline('➕ إضافة قالب عام', b'add_ggrp_template')],
+                [Button.inline('🗑 حذف قالب عام', b'rem_ggrp_template')],
+                [Button.inline('🔙 رجوع', b'manage_grp_templates')],
+            ])
+        
+        elif data == b'add_ggrp_template':
+            if not is_full_admin(user_id):
+                await event.answer("🚫 للأدمن فقط.", alert=True)
+                return
+            login_states[user_id] = {'step': 'add_ggrp_template'}
+            await event.respond("📝 أرسل نص القالب العام للرد في القروب (سيظهر لجميع المستخدمين):")
+        
+        elif data == b'rem_ggrp_template':
+            if not is_full_admin(user_id):
+                await event.answer("🚫 للأدمن فقط.", alert=True)
+                return
+            g_tpl = config.get('GROUP_REPLY_TEMPLATES', [])
+            if not g_tpl:
+                await event.respond("❌ لا توجد قوالب عامة لحذفها.")
+            else:
+                rows = [[Button.inline(f"🗑 {(t[:30] + '...') if len(t) > 30 else t}", f"gdel_grp_tpl_{i}".encode())] for i, t in enumerate(g_tpl)]
+                rows.append([Button.inline('🔙 رجوع', b'manage_ggrp_templates')])
+                await event.respond("اختر القالب العام الذي تريد حذفه:", buttons=rows)
+        
+        elif data.startswith(b'gdel_grp_tpl_'):
+            if not is_full_admin(user_id):
+                await event.answer("🚫 للأدمن فقط.", alert=True)
+                return
+            idx = int(data.decode().replace('gdel_grp_tpl_', ''))
+            g_tpl = config.get('GROUP_REPLY_TEMPLATES', [])
+            if 0 <= idx < len(g_tpl):
+                removed = g_tpl.pop(idx)
+                config['GROUP_REPLY_TEMPLATES'] = g_tpl
+                update_json_config(config)
+                await event.respond(f"✅ تم حذف القالب العام: `{removed[:40]}`")
             else:
                 await event.respond("❌ القالب غير موجود.")
         
@@ -1665,9 +1864,10 @@ async def setup_bot_handlers():
                 message_id = int(parts[3])
                 sender_id = int(parts[4])
                 
-                dm_templates = config.get('DM_REPLY_TEMPLATES', [])
+                # 🔒 كل مستخدم يرد بقوالبه الخاصة هو (+ القوالب العامة للأدمن)
+                dm_templates = get_own_templates(user_id, 'DM', config) + config.get('DM_REPLY_TEMPLATES', [])
                 if not dm_templates:
-                    await event.respond("❌ لا توجد قوالب للرد على الخاص. أضف قالب أولاً من زر ➕ إضافة رد خاص.")
+                    await event.respond("❌ لا توجد قوالب للرد على الخاص. أضف قالبك أولاً من زر 💬 ردودي على الخاص.")
                     return
                 
                 if len(dm_templates) == 1:
@@ -1690,7 +1890,8 @@ async def setup_bot_handlers():
                 sender_id = int(parts[4])
                 tpl_idx = int(parts[5])
                 
-                dm_templates = config.get('DM_REPLY_TEMPLATES', [])
+                # 🔒 نفس قائمة القوالب المعروضة في الاختيار: الخاصة + العامة
+                dm_templates = get_own_templates(user_id, 'DM', config) + config.get('DM_REPLY_TEMPLATES', [])
                 if 0 <= tpl_idx < len(dm_templates):
                     template_text = dm_templates[tpl_idx]
                     await send_dm_reply(event, group_id, message_id, sender_id, template_text)
@@ -1707,9 +1908,10 @@ async def setup_bot_handlers():
                 message_id = int(parts[3])
                 sender_id = int(parts[4])
                 
-                grp_templates = config.get('GROUP_REPLY_TEMPLATES', [])
+                # 🔒 كل مستخدم يرد بقوالبه الخاصة هو (+ القوالب العامة للأدمن)
+                grp_templates = get_own_templates(user_id, 'GRP', config) + config.get('GROUP_REPLY_TEMPLATES', [])
                 if not grp_templates:
-                    await event.respond("❌ لا توجد قوالب للرد في القروب. أضف قالب أولاً من زر ➕ إضافة رد قروب.")
+                    await event.respond("❌ لا توجد قوالب للرد في القروب. أضف قالبك أولاً من زر 👥 ردودي في القروب.")
                     return
                 
                 if len(grp_templates) == 1:
@@ -1732,7 +1934,8 @@ async def setup_bot_handlers():
                 sender_id = int(parts[4])
                 tpl_idx = int(parts[5])
                 
-                grp_templates = config.get('GROUP_REPLY_TEMPLATES', [])
+                # 🔒 نفس قائمة القوالب المعروضة في الاختيار: الخاصة + العامة
+                grp_templates = get_own_templates(user_id, 'GRP', config) + config.get('GROUP_REPLY_TEMPLATES', [])
                 if 0 <= tpl_idx < len(grp_templates):
                     template_text = grp_templates[tpl_idx]
                     await send_group_reply(event, group_id, message_id, sender_id, template_text)
@@ -1761,6 +1964,8 @@ async def setup_bot_handlers():
                 # محاولة من كل الحسابات المراقبة
                 for phone, client in active_clients.items():
                     try:
+                        if not await ensure_connected(client):
+                            continue
                         chat = await client.get_entity(group_id)
                         chat_title = getattr(chat, 'title', 'مجموعة غير معروفة')
                         chat_username = getattr(chat, 'username', None)
@@ -2569,7 +2774,7 @@ async def setup_bot_handlers():
                 )
 
         # إدارة باقي العناصر (إضافة/حذف يدوي للمجموعات والكلمات)
-        elif data in [b'add_kw', b'rem_kw', b'add_ignore', b'rem_ignore', b'add_group', b'rem_group']:
+        elif data in [b'add_ignore', b'rem_ignore', b'add_group', b'rem_group']:
             login_states[user_id] = {'step': data.decode()}
             await event.respond(f"📝 من فضلك أرسل القيمة التي تريد تنفيذ الإجراء عليها:")
 
@@ -2579,8 +2784,11 @@ async def setup_bot_handlers():
         """إرسال رد على الخاص للمرسل"""
         try:
             target_client = None
+            # 🔌 إعادة الاتصال التلقائي قبل أي إرسال — يمنع خطأ Cannot send requests while disconnected
             for phone, client in active_clients.items():
                 try:
+                    if not await ensure_connected(client):
+                        continue
                     await client.get_entity(group_id)
                     target_client = client
                     break
@@ -2593,7 +2801,13 @@ async def setup_bot_handlers():
             
             try:
                 sender_entity = await target_client.get_entity(sender_id)
-                await target_client.send_message(sender_entity, template_text)
+                try:
+                    await target_client.send_message(sender_entity, template_text)
+                except Exception as se:
+                    # 🔌 إعادة اتصال ومحاولة أخيرة قبل الإبلاغ بالفشل
+                    if not await ensure_connected(target_client):
+                        raise se
+                    await target_client.send_message(sender_entity, template_text)
                 preview = template_text[:40] + "..." if len(template_text) > 40 else template_text
                 await event.respond(f"✅ تم إرسال الرد على الخاص:\n\n💬 `{preview}`")
                 logger.info(f"تم إرسال رد خاص للمرسل {sender_id}")
@@ -2609,8 +2823,11 @@ async def setup_bot_handlers():
         """إرسال رد في القروب كرد على رسالة المرسل"""
         try:
             target_client = None
+            # 🔌 إعادة الاتصال التلقائي قبل أي إرسال — يمنع خطأ Cannot send requests while disconnected
             for phone, client in active_clients.items():
                 try:
+                    if not await ensure_connected(client):
+                        continue
                     await client.get_entity(group_id)
                     target_client = client
                     break
@@ -2621,7 +2838,13 @@ async def setup_bot_handlers():
                 await event.respond("❌ لا يوجد حساب مرتبط يمكنه الرد في هذه المجموعة.")
                 return
             
-            await target_client.send_message(group_id, template_text, reply_to=message_id)
+            try:
+                await target_client.send_message(group_id, template_text, reply_to=message_id)
+            except Exception as se:
+                # 🔌 إعادة اتصال ومحاولة أخيرة قبل الإبلاغ بالفشل
+                if not await ensure_connected(target_client):
+                    raise se
+                await target_client.send_message(group_id, template_text, reply_to=message_id)
             preview = template_text[:40] + "..." if len(template_text) > 40 else template_text
             await event.respond(f"✅ تم إرسال الرد في القروب:\n\n👥 `{preview}`")
             logger.info(f"تم إرسال رد في القروب {group_id} على رسالة {message_id}")
@@ -2841,7 +3064,7 @@ async def setup_bot_handlers():
             try:
                 sent_code = await new_client.send_code_request(phone)
                 login_states[user_id] = {'step': 'await_code', 'phone': phone, 'hash': sent_code.phone_code_hash, 'client': new_client, 'owner': state.get('owner', user_id)}
-                await event.respond(f"📩 تم إرسال الكود إلى `{phone}`. من فضلك أرسل الكود هنا:")
+                await event.respond(f"📩 تم إرسال الكود إلى `{phone}`. من فضلك أرسل الكود هنا:\n\n⏳ أرسله **فوراً** — صلاحية الكود قصيرة، وطلب كود جديد من تطبيق آخر يُبطل هذا الكود.")
             except Exception as e:
                 await event.respond(f"❌ خطأ: {e}"); del login_states[user_id]
         
@@ -2849,6 +3072,9 @@ async def setup_bot_handlers():
         elif state['step'] == 'await_code':
             try:
                 client = state['client']
+                # 🔌 التأكد من الاتصال قبل تسجيل الدخول — يمنع خطأ Cannot send requests while disconnected
+                if not client.is_connected():
+                    await client.connect()
                 await client.sign_in(state['phone'], text, phone_code_hash=state['hash'])
                 await event.respond(f"✅ تم ربط الحساب `{state['phone']}` بنجاح! جاري استيراد المجموعات...")
                 
@@ -2870,6 +3096,34 @@ async def setup_bot_handlers():
             except SessionPasswordNeededError:
                 state['step'] = 'await_password'
                 await event.respond("🔐 هذا الحساب محمي بكلمة سر (2FA). من فضلك أرسل كلمة السر:")
+            except PhoneCodeExpiredError:
+                # ⏳ انتهت صلاحية الكود — إعادة إرسال كود جديد تلقائياً لنفس الرقم
+                try:
+                    client = state['client']
+                    if not client.is_connected():
+                        await client.connect()
+                    sent_code = await client.send_code_request(state['phone'])
+                    state['hash'] = sent_code.phone_code_hash
+                    await event.respond(
+                        "⏳ **انتهت صلاحية الكود السابق.**\n\n"
+                        "📩 أرسلت لك **كوداً جديداً** الآن — انسخه وأرسله هنا **فوراً** قبل انتهاء صلاحيته.\n"
+                        "💡 لا تطلب كوداً جديداً من تطبيق آخر بالتوازي — كل طلب جديد يُبطل الكود السابق."
+                    )
+                    logger.info(f"⏳ انتهت صلاحية كود {state['phone']} — أُرسل كود جديد تلقائياً")
+                except Exception as re_err:
+                    del login_states[user_id]
+                    await event.respond(
+                        "⏳ انتهت صلاحية الكود ولم أتمكن من إرسال كود جديد تلقائياً.\n"
+                        f"السبب: `{str(re_err)[:100]}`\n\n"
+                        "🔄 أعد المحاولة من ➕ إضافة حسابي وأرسل الكود فور وصوله."
+                    )
+            except PhoneCodeInvalidError:
+                # ❌ الكود غير صحيح — السماح بإعادة المحاولة دون إلغاء العملية
+                await event.respond(
+                    "❌ **الكود غير صحيح.**\n\n"
+                    "تأكد من نسخ الكود كامداً وأعد إرساله هنا.\n"
+                    "💡 إن مرّت عدة دقائق فالكود قد يكون انتهى — أرسل /cancel ثم أعد ➕ إضافة حسابي لكود جديد."
+                )
             except Exception as e:
                 await event.respond(f"❌ خطأ: {e}"); del login_states[user_id]
 
@@ -2877,6 +3131,9 @@ async def setup_bot_handlers():
         elif state['step'] == 'await_password':
             try:
                 client = state['client']
+                # 🔌 التأكد من الاتصال قبل تسجيل الدخول
+                if not client.is_connected():
+                    await client.connect()
                 await client.sign_in(password=text)
                 await event.respond(f"✅ تم ربط الحساب `{state['phone']}` بنجاح!")
                 
@@ -2895,17 +3152,17 @@ async def setup_bot_handlers():
             except Exception as e:
                 await event.respond(f"❌ خطأ: {e}"); del login_states[user_id]
 
-        # إضافة كلمة مفتاحية
+        # إضافة كلمة مفتاحية خاصة بالمستخدم
         elif state['step'] == 'add_kw':
-            config['KEYWORDS'] = list(set(config.get('KEYWORDS', []) + [text]))
-            update_json_config(config)
-            await event.respond(f"✅ تم إضافة الكلمة: `{text}`"); del login_states[user_id]
-
-        # حذف كلمة مفتاحية
-        elif state['step'] == 'rem_kw':
-            config['KEYWORDS'] = [k for k in config.get('KEYWORDS', []) if k != text]
-            update_json_config(config)
-            await event.respond(f"✅ تم حذف الكلمة: `{text}`"); del login_states[user_id]
+            # 🔒 خصوصية: الكلمة تُحفظ في قائمة المستخدم الخاص — لا تُشارك مع غيره
+            my_kw = get_user_keywords(user_id, config)
+            if text not in my_kw:
+                my_kw.append(text)
+                set_user_keywords(user_id, my_kw, config)
+                await event.respond(f"✅ تم إضافة الكلمة إلى قائمتك الخاصة: `{text}`")
+            else:
+                await event.respond(f"ℹ️ الكلمة موجودة في قائمتك بالفعل: `{text}`")
+            del login_states[user_id]
 
         # إضافة مستخدم للتجاهل
         elif state['step'] == 'add_ignore':
@@ -2998,24 +3255,52 @@ async def setup_bot_handlers():
                 await event.respond("❌ من فضلك أرسل رقماً صحيحاً")
             del login_states[user_id]
 
-        # ============ إضافة قالب الرد على الخاص ============
+        # ============ إضافة قالب الرد على الخاص (خاص بالمستخدم) ============
         elif state['step'] == 'add_dm_template':
+            # 🔒 خصوصية: القالب يُحفظ في قوالب المستخدم الخاص
+            dm_templates = get_own_templates(user_id, 'DM', config)
+            dm_templates.append(text)
+            set_own_templates(user_id, 'DM', dm_templates, config)
+            preview = text[:50] + "..." if len(text) > 50 else text
+            await event.respond(f"✅ تم إضافة القالب إلى **ردودك الخاصة**:\n\n💬 `{preview}`")
+            del login_states[user_id]
+
+        # ============ إضافة قالب الرد في القروب (خاص بالمستخدم) ============
+        elif state['step'] == 'add_grp_template':
+            # 🔒 خصوصية: القالب يُحفظ في قوالب المستخدم الخاص
+            grp_templates = get_own_templates(user_id, 'GRP', config)
+            grp_templates.append(text)
+            set_own_templates(user_id, 'GRP', grp_templates, config)
+            preview = text[:50] + "..." if len(text) > 50 else text
+            await event.respond(f"✅ تم إضافة القالب إلى **ردودك الخاصة**:\n\n👥 `{preview}`")
+            del login_states[user_id]
+
+        # ============ إضافة قالب عام (أدمن) — الخاص ============
+        elif state['step'] == 'add_gdm_template':
+            if not is_full_admin(user_id):
+                await event.respond("🚫 للأدمن فقط.")
+                del login_states[user_id]
+                return
             dm_templates = config.get('DM_REPLY_TEMPLATES', [])
             dm_templates.append(text)
             config['DM_REPLY_TEMPLATES'] = dm_templates
             update_json_config(config)
             preview = text[:50] + "..." if len(text) > 50 else text
-            await event.respond(f"✅ تم إضافة قالب الرد على الخاص:\n\n💬 `{preview}`")
+            await event.respond(f"✅ تم إضافة القالب **العام** (يظهر للجميع):\n\n💬 `{preview}`")
             del login_states[user_id]
 
-        # ============ إضافة قالب الرد في القروب ============
-        elif state['step'] == 'add_grp_template':
+        # ============ إضافة قالب عام (أدمن) — القروب ============
+        elif state['step'] == 'add_ggrp_template':
+            if not is_full_admin(user_id):
+                await event.respond("🚫 للأدمن فقط.")
+                del login_states[user_id]
+                return
             grp_templates = config.get('GROUP_REPLY_TEMPLATES', [])
             grp_templates.append(text)
             config['GROUP_REPLY_TEMPLATES'] = grp_templates
             update_json_config(config)
             preview = text[:50] + "..." if len(text) > 50 else text
-            await event.respond(f"✅ تم إضافة قالب الرد في القروب:\n\n👥 `{preview}`")
+            await event.respond(f"✅ تم إضافة القالب **العام** (يظهر للجميع):\n\n👥 `{preview}`")
             del login_states[user_id]
 
         # ============ إضافة رد مباشر من القناة - خاص ============
@@ -3024,16 +3309,15 @@ async def setup_bot_handlers():
             message_id = state.get('message_id')
             sender_id = state.get('sender_id')
             
-            # حفظ القالب
-            dm_templates = config.get('DM_REPLY_TEMPLATES', [])
+            # حفظ القالب في ردود المستخدم الخاصة (خصوصية)
+            dm_templates = get_own_templates(user_id, 'DM', config)
             dm_templates.append(text)
-            config['DM_REPLY_TEMPLATES'] = dm_templates
-            update_json_config(config)
+            set_own_templates(user_id, 'DM', dm_templates, config)
             
             # إرسال الرد مباشرة
             await send_dm_reply(event, group_id, message_id, sender_id, text)
             preview = text[:40] + "..." if len(text) > 40 else text
-            await event.respond(f"💾 تم حفظ القالب أيضاً في قوالب الرد على الخاص: `{preview}`")
+            await event.respond(f"💾 تم حفظ القالب في **ردودك الخاصة** أيضاً: `{preview}`")
             del login_states[user_id]
 
         # ============ إضافة رد مباشر من القناة - قروب ============
@@ -3042,16 +3326,15 @@ async def setup_bot_handlers():
             message_id = state.get('message_id')
             sender_id = state.get('sender_id')
             
-            # حفظ القالب
-            grp_templates = config.get('GROUP_REPLY_TEMPLATES', [])
+            # حفظ القالب في ردود المستخدم الخاصة (خصوصية)
+            grp_templates = get_own_templates(user_id, 'GRP', config)
             grp_templates.append(text)
-            config['GROUP_REPLY_TEMPLATES'] = grp_templates
-            update_json_config(config)
+            set_own_templates(user_id, 'GRP', grp_templates, config)
             
             # إرسال الرد مباشرة
             await send_group_reply(event, group_id, message_id, sender_id, text)
             preview = text[:40] + "..." if len(text) > 40 else text
-            await event.respond(f"💾 تم حفظ القالب أيضاً في قوالب الرد في القروب: `{preview}`")
+            await event.respond(f"💾 تم حفظ القالب في **ردودك الخاصة** أيضاً: `{preview}`")
             del login_states[user_id]
 
         # ============ إضافة رد تلقائي - الكلمة المفتاحية ============
