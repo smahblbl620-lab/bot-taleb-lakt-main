@@ -80,6 +80,8 @@ def stats_endpoint():
         "active_clients_count": len(active_clients),
         "keywords_loaded": config.get('KEYWORDS', []),
         "keywords_count": len(config.get('KEYWORDS', [])),
+        "default_keywords": config.get('DEFAULT_KEYWORDS', []),
+        "default_keywords_count": len(config.get('DEFAULT_KEYWORDS', [])),
         "filters": config.get('FILTERS', {}),
         "detect_links": config.get('DETECT_LINKS', True),
         "channel_id": os.environ.get('CHANNEL_ID'),
@@ -235,6 +237,112 @@ def set_user_keywords(user_id, items, cfg=None):
     maps[str(user_id)] = items
     cfg['USER_KEYWORDS'] = maps
     update_json_config(cfg)
+
+def get_default_keywords(cfg=None):
+    """🌟 الكلمات المفتاحية الافتراضية — متوفرة لكل الحسابات تلقائياً"""
+    if cfg is None:
+        cfg = load_json_config()
+    return list(cfg.get('DEFAULT_KEYWORDS', ["يسوي", "تسوي", "تشرح", "يشرح", "خصوصي", "احد", "يحل", "تحل", "تعرفون", "ابغى", "بغيت"]))
+
+def get_user_deleted_defaults(user_id, cfg=None):
+    """الافتراضيات التي أخفاها هذا المستخدم عن نفسه (حذف شخصي فقط — لا يؤثر على غيره)"""
+    if cfg is None:
+        cfg = load_json_config()
+    return cfg.get('USER_DELETED_DEFAULTS', {}).get(str(user_id), [])
+
+def remove_user_default(user_id, word, cfg=None):
+    """🌟🗑 إخفاء كلمة افتراضية عن مستخدم محدد (حذف شخصي)"""
+    if cfg is None:
+        cfg = load_json_config()
+    maps = cfg.get('USER_DELETED_DEFAULTS', {})
+    lst = maps.get(str(user_id), [])
+    if word not in lst:
+        lst.append(word)
+    maps[str(user_id)] = lst
+    cfg['USER_DELETED_DEFAULTS'] = maps
+    update_json_config(cfg)
+
+def restore_user_default(user_id, word, cfg=None):
+    """♻️ استعادة كلمة افتراضية كانت مخفية لمستخدم محدد"""
+    if cfg is None:
+        cfg = load_json_config()
+    maps = cfg.get('USER_DELETED_DEFAULTS', {})
+    lst = [w for w in maps.get(str(user_id), []) if w != word]
+    maps[str(user_id)] = lst
+    cfg['USER_DELETED_DEFAULTS'] = maps
+    update_json_config(cfg)
+
+def get_effective_keywords(user_id, cfg=None):
+    """🔑 الكلمات الفعالة لمستخدم: الافتراضية (عدا ما أخفاها) + الخاصة به + العامة (أدمن) — بدون تكرار"""
+    if cfg is None:
+        cfg = load_json_config()
+    deleted = get_user_deleted_defaults(user_id, cfg)
+    defaults_active = [k for k in get_default_keywords(cfg) if k not in deleted]
+    my_kw = cfg.get('USER_KEYWORDS', {}).get(str(user_id), [])
+    gkw = cfg.get('KEYWORDS', [])
+    return list(dict.fromkeys(defaults_active + my_kw + gkw))
+
+async def send_kw_delete_screen(event, user_id, config, edit=False):
+    """🗑 شاشة حذف الكلمات بالأزرار — الافتراضية 🌟 والخاصة 🔑: اضغط الكلمة تُحذف فوراً"""
+    defaults = get_default_keywords(config)
+    my_kw = get_user_keywords(user_id, config)
+    if not defaults and not my_kw:
+        txt = "❌ لا توجد كلمات لحذفها — أضف كلمة أولاً من ➕ إضافة كلمة."
+        rows = [[Button.inline('🔙 رجوع', b'manage_kw')]]
+    else:
+        txt = "🗑 **اضغط على الكلمة لحذفها فوراً من قائمتك:**\n\n"
+        rows = []
+        if defaults:
+            txt += "🌟 **الافتراضية** (متاحة لكل الحسابات — الحذف يخفيها عندك فقط):\n"
+            pair = []
+            for i, k in enumerate(defaults[:40]):
+                preview = k[:18] + "..." if len(k) > 18 else k
+                pair.append(Button.inline(f"🌟 {preview}", f"delflt_{i}".encode()))
+                if len(pair) == 2:
+                    rows.append(pair)
+                    pair = []
+            if pair:
+                rows.append(pair)
+        if my_kw:
+            txt += "\n🔑 **كلماتك الخاصة** (اضغطها تُحذف نهائياً):\n"
+            for i, k in enumerate(my_kw[:40]):
+                preview = k[:25] + "..." if len(k) > 25 else k
+                rows.append([Button.inline(f"🗑 {preview}", f"delkw_{i}".encode())])
+        rows.append([Button.inline('🔙 رجوع', b'manage_kw')])
+    if edit:
+        try:
+            await event.edit(txt, buttons=rows)
+            return
+        except Exception:
+            pass
+    await event.respond(txt, buttons=rows)
+
+async def send_kw_restore_screen(event, user_id, config, edit=False):
+    """♻️ شاشة استعادة الكلمات الافتراضية المخفية — اضغط الكلمة تُستعاد فوراً"""
+    deleted = get_user_deleted_defaults(user_id, config)
+    if not deleted:
+        txt = "✅ لا توجد كلمات افتراضية محذوفة عندك — كل الافتراضية مفعّلة."
+        rows = [[Button.inline('🔙 رجوع', b'manage_kw')]]
+    else:
+        txt = "♻️ **اضغط على الكلمة الافتراضية لاستعادتها وتفعيلها مجدداً:**"
+        rows = []
+        pair = []
+        for i, k in enumerate(deleted[:40]):
+            preview = k[:18] + "..." if len(k) > 18 else k
+            pair.append(Button.inline(f"♻️ {preview}", f"rstflt_{i}".encode()))
+            if len(pair) == 2:
+                rows.append(pair)
+                pair = []
+        if pair:
+            rows.append(pair)
+        rows.append([Button.inline('🔙 رجوع', b'manage_kw')])
+    if edit:
+        try:
+            await event.edit(txt, buttons=rows)
+            return
+        except Exception:
+            pass
+    await event.respond(txt, buttons=rows)
 
 def get_own_templates(user_id, kind, cfg=None):
     """💬 القوالب الخاصة بمستخدم محدد (kind='DM' أو 'GRP') — كل مستخدم يرى قوالب هو فقط"""
@@ -789,10 +897,13 @@ async def process_message(event, client, phone):
     """معالجة الرسالة الواردة من أي حساب مراقب"""
     global message_map, seen_messages, stats
     config = load_json_config()
-    # 🔑 كلمات مفتاحية خاصة بمالك الحساب أولاً ثم الكلمات العامة الافتراضية (خصوصية بين المستخدمين)
+    # 🔑 كلمات مفتاحية فعالة لمالك الحساب: الافتراضية (🌟 عدا ما أخفاها بنفسه) + الخاصة به + العامة (خصوصية بين المستخدمين)
     _owner_id = config.get('ACCOUNT_OWNERS', {}).get(str(phone))
-    _my_kw = config.get('USER_KEYWORDS', {}).get(str(_owner_id), []) if _owner_id is not None else []
-    keywords = list(dict.fromkeys(_my_kw + config.get('KEYWORDS', [])))
+    if _owner_id is not None:
+        keywords = get_effective_keywords(_owner_id, config)
+    else:
+        # حساب بلا مالك مسجل → الافتراضية فقط (لا كلمات خاصة لأحد)
+        keywords = list(dict.fromkeys(get_default_keywords(config) + config.get('KEYWORDS', [])))
     ignore_users = config.get('IGNORE_USERS', [])
     
     # تجاهل الرسائل الخاصة (DM) - نراقب فقط القروبات والقنوات
@@ -1328,43 +1439,83 @@ async def setup_bot_handlers():
         # ============ إدارة الكلمات المفتاحية ============
         
         elif data == b'manage_kw':
-            # 🔒 خصوصية: كل مستخدم يضيف ويدير كلماته بنفسه — ولا تظهر لكلمات المستخدم الآخر
+            # 🔒 خصوصية: كل مستخدم يدير كلماته بنفسه — الافتراضية 🌟 متاحة للجميع والحذف فيها شخصي لا يؤثر على غيره
+            defaults = get_default_keywords(config)
+            deleted = get_user_deleted_defaults(user_id, config)
             my_kw = get_user_keywords(user_id, config)
-            msg = ("🔑 **كلماتك المفتاحية الخاصة**\n\n"
-                   "رسائل حساباتك تُلتقط عندما يحتوي نصها على إحدى كلماتك.\n\n")
+            active_defaults = [k for k in defaults if k not in deleted]
+            msg = ("🔑 **كلماتك المفتاحية**\n\n"
+                   "رسائل حساباتك تُلتقط عندما يحتوي نصها على إحدى هذه الكلمات.\n\n")
+            msg += f"🌟 **الافتراضية المفعّلة** ({len(active_defaults)}/{len(defaults)} — متاحة لكل الحسابات):\n"
+            msg += ("`" + "`, `".join(active_defaults) + "`") if active_defaults else "لا شيء — أخفيتها كلها، استعدها من ♻️ استعادة."
+            msg += f"\n\n🔑 **كلماتك الخاصة** ({len(my_kw)}):\n"
             if my_kw:
-                for i, k in enumerate(my_kw, 1):
+                for i, k in enumerate(my_kw[:15], 1):
                     msg += f"{i}. `{k}`\n"
+                if len(my_kw) > 15:
+                    msg += f"... و{len(my_kw) - 15} أخرى\n"
             else:
-                msg += "لا توجد كلمات بعد — أضف كلمتك الأولى من ➕ إضافة كلمة."
+                msg += "لا توجد — أضف كلماتك من ➕ إضافة كلمة."
             if is_full_admin(user_id):
                 gkw = config.get('KEYWORDS', [])
-                msg += f"\n🌍 كلمات عامة افتراضية (أدمن): **{len(gkw)}**" + ((" — `" + "`, `".join(gkw[:10]) + "`") if gkw else "")
-            await event.respond(msg, buttons=[
+                msg += f"\n🌍 كلمات عامة (أدمن): **{len(gkw)}**" + ((" — `" + "`, `".join(gkw[:10]) + "`") if gkw else "")
+            buttons = [
                 [Button.inline('➕ إضافة كلمة', b'add_kw'), Button.inline('🗑 حذف كلمة', b'rem_kw')],
-                [Button.inline('🔙 رجوع', b'back_main')],
-            ])
+            ]
+            if deleted:
+                buttons.append([Button.inline(f'♻️ استعادة محذوفة ({len(deleted)})', b'rst_kw')])
+            buttons.append([Button.inline('🔙 رجوع', b'back_main')])
+            await event.respond(msg, buttons=buttons)
 
         elif data == b'add_kw':
             login_states[user_id] = {'step': 'add_kw'}
             await event.respond(
-                "📝 أرسل الكلمة المفتاحية التي تريد إضافتها لقائمتك الخاصة:\n\n"
+                "📝 أرسل الكلمة المفتاحية التي تريد إضافتها لقائمتك:\n\n"
+                "🌟 ملاحظة: الكلمات الافتراضية (يسوي، تسوي، تعرفون، ابغى...) مفعّلة أصلاً لكل الحسابات.\n"
                 "💡 عندما تحتوي رسالة على هذه الكلمة تُلتقط وتُوجّه لقروبك.\n"
                 "💡 للإلغاء أرسل: `/cancel`"
             )
 
         elif data == b'rem_kw':
-            # 🗑 حذف الكلمات بالأزرار — اضغط الكلمة تُحذف فوراً (بدون كتابة اسمها)
-            my_kw = get_user_keywords(user_id, config)
-            if not my_kw:
-                await event.respond("❌ لا توجد كلمات خاصة بك لحذفها — أضف كلمة أولاً من ➕ إضافة كلمة.")
+            # 🗑 حذف الكلمات بالأزرار — الافتراضية 🌟 والخاصة 🔑: اضغط الكلمة تُحذف فوراً (بدون كتابة اسمها)
+            await send_kw_delete_screen(event, user_id, config)
+
+        elif data.startswith(b'delflt_'):
+            # 🌟 حذف (إخفاء) كلمة افتراضية لهذا المستخدم فقط
+            try:
+                idx = int(data.decode()[7:])
+            except ValueError:
+                await event.answer("❌ بيانات غير صحيحة.", alert=True)
+                return
+            defaults = get_default_keywords(config)
+            if 0 <= idx < len(defaults):
+                removed = defaults[idx]
+                remove_user_default(user_id, removed, config)
+                await event.answer(f"🗑 أُخفيت: {removed[:30]}")
+                logger.info(f"🌟 المستخدم {user_id} أخفى الكلمة الافتراضية: {removed}")
+                await send_kw_delete_screen(event, user_id, load_json_config(), edit=True)
             else:
-                rows = []
-                for i, k in enumerate(my_kw[:40]):
-                    preview = k[:25] + "..." if len(k) > 25 else k
-                    rows.append([Button.inline(f"🗑 {preview}", f"delkw_{i}".encode())])
-                rows.append([Button.inline('🔙 رجوع', b'manage_kw')])
-                await event.respond("🗑 **اضغط على الكلمة لحذفها فوراً:**", buttons=rows)
+                await event.answer("❌ الكلمة غير موجودة — حدّث القائمة.", alert=True)
+
+        elif data == b'rst_kw':
+            # ♻️ استعادة الكلمات الافتراضية المخفية
+            await send_kw_restore_screen(event, user_id, config)
+
+        elif data.startswith(b'rstflt_'):
+            try:
+                idx = int(data.decode()[7:])
+            except ValueError:
+                await event.answer("❌ بيانات غير صحيحة.", alert=True)
+                return
+            deleted = get_user_deleted_defaults(user_id, config)
+            if 0 <= idx < len(deleted):
+                restored = deleted[idx]
+                restore_user_default(user_id, restored, config)
+                await event.answer(f"♻️ استُعيدت: {restored[:30]}")
+                logger.info(f"♻️ المستخدم {user_id} استعاد الكلمة الافتراضية: {restored}")
+                await send_kw_restore_screen(event, user_id, load_json_config(), edit=True)
+            else:
+                await event.answer("❌ الكلمة غير موجودة — حدّث القائمة.", alert=True)
 
         elif data.startswith(b'delkw_'):
             try:
@@ -1378,6 +1529,7 @@ async def setup_bot_handlers():
                 set_user_keywords(user_id, my_kw, config)
                 await event.answer(f"🗑 حُذفت: {removed[:30]}")
                 logger.info(f"🔑 المستخدم {user_id} حذف كلمته المفتاحية: {removed}")
+                await send_kw_delete_screen(event, user_id, load_json_config(), edit=True)
             else:
                 await event.answer("❌ الكلمة غير موجودة — حدّث القائمة.", alert=True)
 
@@ -3155,13 +3307,22 @@ async def setup_bot_handlers():
         # إضافة كلمة مفتاحية خاصة بالمستخدم
         elif state['step'] == 'add_kw':
             # 🔒 خصوصية: الكلمة تُحفظ في قائمة المستخدم الخاص — لا تُشارك مع غيره
+            # 🌟 منطق ذكي: إذا كانت افتراضية محذوفة → استعادة | إذا افتراضية مفعّلة → تنبيه | غير ذلك → إضافة
+            _txt = text.strip()
+            _defaults = get_default_keywords(config)
+            _deleted = get_user_deleted_defaults(user_id, config)
             my_kw = get_user_keywords(user_id, config)
-            if text not in my_kw:
-                my_kw.append(text)
-                set_user_keywords(user_id, my_kw, config)
-                await event.respond(f"✅ تم إضافة الكلمة إلى قائمتك الخاصة: `{text}`")
+            if _txt in _deleted:
+                restore_user_default(user_id, _txt, config)
+                await event.respond(f"♻️ الكلمة `{_txt}` من الكلمات **الافتراضية** كانت محذوفة عندك — **استُعيدت وأصبحت مفعّلة**.")
+            elif _txt in _defaults:
+                await event.respond(f"ℹ️ الكلمة `{_txt}` **افتراضية مفعّلة أصلاً** لكل الحسابات — لا حاجة لإضافتها.")
+            elif _txt in my_kw:
+                await event.respond(f"ℹ️ الكلمة موجودة في قائمتك بالفعل: `{_txt}`")
             else:
-                await event.respond(f"ℹ️ الكلمة موجودة في قائمتك بالفعل: `{text}`")
+                my_kw.append(_txt)
+                set_user_keywords(user_id, my_kw, config)
+                await event.respond(f"✅ تم إضافة الكلمة إلى قائمتك: `{_txt}`")
             del login_states[user_id]
 
         # إضافة مستخدم للتجاهل
@@ -3471,7 +3632,8 @@ async def main():
         logger.warning(f"⚠️ الحد الأقصى للأحرف ({max_len}) صغير جداً! قد يمنع توجيه أغلب الرسائل. يُنصح بتعيينه 0 (بدون حد)")
     if filters.get('block_links', False):
         logger.warning("⚠️ منع الروابط مفعل! أغلب رسائل VPN تحتوي روابط وسيتم تجاهلها. يُنصح بتعطيله.")
-    logger.info(f"📋 الكلمات المفتاحية: {config.get('KEYWORDS', [])}")
+    logger.info(f"📋 الكلمات المفتاحية العامة (أدمن): {config.get('KEYWORDS', [])}")
+    logger.info(f"🌟 الكلمات الافتراضية المفعّلة لكل الحسابات: {config.get('DEFAULT_KEYWORDS', [])}")
     logger.info(f"👑 الأدمن الرئيسي: {MAIN_ADMIN_ID}")
     logger.info(f"🛡 الأدمنة الثابتون (صلاحيات كاملة): {sorted(EXTRA_MAIN_ADMINS) or 'لا يوجد'}")
     logger.info(f"👥 المشرفون المضافون: {config.get('ADMINS', [])}")

@@ -61,7 +61,10 @@ def load_json_config():
         "ADMIN_GROUP_ID": 0,
         "ADMIN_PERMISSIONS": {},
         "MAX_ACCOUNTS_PER_USER": 3,
+        # 🌟 كلمات مفتاحية افتراضية متوفرة لكل الحسابات — كل مستخدم يقدر يحذف أي واحدة منها لنفسه (USER_DELETED_DEFAULTS) أو يضيف كلمات أخرى (USER_KEYWORDS)
+        "DEFAULT_KEYWORDS": ["يسوي", "تسوي", "تشرح", "يشرح", "خصوصي", "احد", "يحل", "تحل", "تعرفون", "ابغى", "بغيت"],
         "USER_KEYWORDS": {},
+        "USER_DELETED_DEFAULTS": {},
         "USER_DM_TEMPLATES": {},
         "USER_GRP_TEMPLATES": {}
     }
