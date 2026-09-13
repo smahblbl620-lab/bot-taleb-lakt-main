@@ -6,7 +6,7 @@ import re
 import time
 import shutil
 from telethon import TelegramClient, events, Button
-from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, PhoneCodeExpiredError, FloodWaitError, PhoneCodeFloodError, PhoneNumberInvalidError
+from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, PhoneCodeExpiredError, FloodWaitError, PhoneNumberFloodError, PhoneNumberInvalidError
 from telethon.sessions import StringSession
 from telethon.tl.types import Chat, Channel, ChatInviteAlready
 from telethon.tl.functions.messages import ExportChatInviteRequest, CheckChatInviteRequest
@@ -1554,7 +1554,7 @@ async def setup_bot_handlers():
                 logger.info(f"📨 المستخدم {user_id} أعاد إرسال كود التحقق لـ {st['phone']} (زر الإعادة)")
             except FloodWaitError as fw:
                 await event.answer(f"⛔ تيليجرام يطلب الانتظار {fw.seconds} ثانية قبل كود جديد.", alert=True)
-            except PhoneCodeFloodError:
+            except PhoneNumberFloodError:
                 await event.answer("⛔ أكواد كثيرة لهذا الرقم — انتظر ساعة تقريباً ثم أعد المحاولة.", alert=True)
             except Exception as e:
                 await event.answer(f"❌ فشل: {str(e)[:80]}", alert=True)
@@ -3266,7 +3266,7 @@ async def setup_bot_handlers():
                     f"⛔ **تيليجرام يطلب الانتظار {fw.seconds} ثانية** قبل إرسال كود لهذا الرقم (بسبب طلبات متكررة).\n\n"
                     f"⏳ انتظر المدة المذكورة ثم أعد إرسال الرقم هنا، أو أرسل `/cancel`."
                 )
-            except PhoneCodeFloodError:
+            except PhoneNumberFloodError:
                 # ⛔ كثرة أكواد لهذا الرقم — حظر طويل نسبياً
                 await event.respond(
                     "⛔ **تم إرسال أكواد كثيرة لهذا الرقم مؤخراً** — تيليجرام يمنع إرسال أكواد جديدة مؤقتاً (قد تدوم ساعة أو أكثر).\n\n"
