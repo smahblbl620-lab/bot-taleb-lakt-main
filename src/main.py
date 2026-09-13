@@ -3237,6 +3237,49 @@ async def setup_bot_handlers():
         # إضافة حساب - رقم الهاتف
         elif state['step'] == 'await_phone':
             phone = text.strip()
+            # 🔒 منع خطأ database is locked: ملف الجلسة (SQLite) لا يُفتح من عميلين معاً —
+            # نغلق أي عميل قديم مفتوح على نفس الرقم قبل إنشاء عميل جديد
+            # 1) محاولات تسجيل معلقة على نفس الرقم (من نفس المستخدم أو غيره)
+            for _uid, _st in list(login_states.items()):
+                if _st.get('phone') == phone and _st.get('client') is not None and _st.get('step') in ('await_code', 'await_password', 'await_phone'):
+                    try:
+                        await _st.get('client').disconnect()
+                    except Exception:
+                        pass
+                    login_states.pop(_uid, None)
+                    if _uid != user_id:
+                        try:
+                            await bot.send_message(_uid, f"ℹ️ أُلغيت عملية تسجيل الحساب `{phone}` لأن مستخدماً آخر أضاف نفس الرقم الآن.")
+                        except Exception:
+                            pass
+                    logger.info(f"🔒 أُغلق عميل تسجيل معلق على {phone} (كان للمستخدم {_uid}) لمنع database is locked")
+            # 2) عميل مراقب نشط لنفس الرقم (مستعاد بعد النشر أو مربوط سابقاً)
+            old_active = active_clients.get(phone)
+            if old_active is not None:
+                try:
+                    already_auth = await old_active.is_user_authorized()
+                except Exception:
+                    already_auth = False
+                if already_auth:
+                    # الحساب يعمل فعلاً — لا تفتح ملف جلسته من عميل ثانٍ (سبب database is locked)
+                    _owner_now = config.get('ACCOUNT_OWNERS', {}).get(phone)
+                    if _owner_now and str(_owner_now) != str(user_id) and not is_full_admin(user_id):
+                        del login_states[user_id]
+                        await event.respond("🚫 هذا الحساب مسجل لدى مستخدم آخر — لا يمكنك إضافته.")
+                        return
+                    await event.respond(
+                        f"ℹ️ الحساب `{phone}` **مربوط ويعمل بالفعل** — لا حاجة لإضافته مجدداً.\n\n"
+                        "💡 إذا أردت إعادة ربطه: احذفه أولاً من ❌ حذف حسابي ثم أضفه من جديد."
+                    )
+                    del login_states[user_id]
+                    return
+                # عميل ميت/غير مصرح — أغلقه ونكمل التسجيل من جديد
+                try:
+                    await old_active.disconnect()
+                except Exception:
+                    pass
+                active_clients.pop(phone, None)
+                logger.info(f"🔒 أُغلق عميل مراقب قديم غير مصرح لـ {phone} قبل إعادة التسجيل (database is locked)")
             new_client = TelegramClient(os.path.join(SESSION_DIR, f'session_{phone}'), API_ID, API_HASH, **CLIENT_OPTS)
             await new_client.connect()
             try:
@@ -3273,8 +3316,16 @@ async def setup_bot_handlers():
                     "⏳ انتظر فترة ثم أعد المحاولة من ➕ إضافة حسابي، أو أرسل `/cancel`."
                 )
             except Exception as e:
-                await event.respond(f"❌ خطأ: {e}"); del login_states[user_id]
-        
+                if 'database is locked' in str(e).lower():
+                    await event.respond(
+                        "🔒 **قاعدة بيانات الجلسة مشغولة مؤقتاً** (كان ملف الجلسة مفتوحاً من عملية أخرى).\n\n"
+                        "⏳ انتظر 30 ثانية ثم أعد المحاولة من ➕ إضافة حسابي — البوت يغلق العملية القديمة تلقائياً الآن.\n"
+                        "💡 إن تكررت: أعد تشغيل عملية الإضافة بعد دقيقة واحدة."
+                    )
+                    del login_states[user_id]
+                else:
+                    await event.respond(f"❌ خطأ: {e}"); del login_states[user_id]
+
         # إضافة حساب - رمز التحقق
         elif state['step'] == 'await_code':
             try:
