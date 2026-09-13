@@ -282,6 +282,38 @@ def get_effective_keywords(user_id, cfg=None):
     gkw = cfg.get('KEYWORDS', [])
     return list(dict.fromkeys(defaults_active + my_kw + gkw))
 
+MAX_KEYWORD_LEN = 40  # أطول كلمة مفتاحية مسموحة — يمنع لصق رسائل كاملة ككلمة
+
+def parse_keywords_input(text):
+    """🧩 تفكيك مدخلات الكلمات: كل سطر كلمة، أو كلمات مفصولة بفواصل (، , ؛ ;) — يمنع تخزين رسالة كاملة ككلمة واحدة"""
+    parts = re.split(r'[\n\u060C,\u061B;]+', text or '')
+    out, seen = [], set()
+    for p in parts:
+        s = re.sub(r'^[-•*–—]\s+', '', p.strip()).strip()  # إزالة علامات التعداد من الكلمات الملصوقة من قائمة قديمة
+        if not s or len(s) > MAX_KEYWORD_LEN or '\n' in s:
+            continue
+        if s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out[:10]  # حد أقصى 10 كلمات في الرسالة الواحدة
+
+def sanitize_keywords_config(cfg):
+    """🧹 تنظيف تلقائي: يزيل أي كلمة مشوهة (تحتوي سطراً جديداً أو أطول من الحد — ناتجة عن لصق رسالة كاملة) من الكلمات العامة وقوائم المستخدمين — يعيد True إن تغير شيء"""
+    changed = False
+    gkw = cfg.get('KEYWORDS', [])
+    clean_g = [k for k in gkw if isinstance(k, str) and k.strip() and '\n' not in k and len(k.strip()) <= MAX_KEYWORD_LEN]
+    if len(clean_g) != len(gkw):
+        cfg['KEYWORDS'] = clean_g
+        changed = True
+    maps = cfg.get('USER_KEYWORDS', {})
+    for uid, kws in list(maps.items()):
+        if isinstance(kws, list):
+            clean_u = [k for k in kws if isinstance(k, str) and k.strip() and '\n' not in k and len(k.strip()) <= MAX_KEYWORD_LEN]
+            if len(clean_u) != len(kws):
+                maps[uid] = clean_u
+                changed = True
+    return changed
+
 async def send_kw_delete_screen(event, user_id, config, edit=False):
     """🗑 شاشة حذف الكلمات بالأزرار — الافتراضية 🌟 والخاصة 🔑: اضغط الكلمة تُحذف فوراً"""
     defaults = get_default_keywords(config)
@@ -1470,9 +1502,10 @@ async def setup_bot_handlers():
         elif data == b'add_kw':
             login_states[user_id] = {'step': 'add_kw'}
             await event.respond(
-                "📝 أرسل الكلمة المفتاحية التي تريد إضافتها لقائمتك:\n\n"
-                "🌟 ملاحظة: الكلمات الافتراضية (يسوي، تسوي، تعرفون، ابغى...) مفعّلة أصلاً لكل الحسابات.\n"
-                "💡 عندما تحتوي رسالة على هذه الكلمة تُلتقط وتُوجّه لقروبك.\n"
+                "📝 أرسل الكلمة المفتاحية التي تريد إضافتها لقائمتك.\n\n"
+                "🧩 يمكنك إرسال **عدة كلمات دفعة واحدة**: كل سطر كلمة، أو افصل بينها بفاصلة `،`\n"
+                "🌟 ملاحظة: الكلمات الافتراضية (يسوي، تسوي، تعرفون، ابغى...) مفعّلة أصلاً لكل الحسابات — وإن أرسلت واحدة كانت محذوفة عندك فتُستعاد تلقائياً.\n"
+                "💡 عندما تحتوي رسالة على إحدى كلماتك تُلتقط وتُوجّه لقروبك.\n"
                 "💡 للإلغاء أرسل: `/cancel`"
             )
 
@@ -3421,23 +3454,40 @@ async def setup_bot_handlers():
 
         # إضافة كلمة مفتاحية خاصة بالمستخدم
         elif state['step'] == 'add_kw':
-            # 🔒 خصوصية: الكلمة تُحفظ في قائمة المستخدم الخاص — لا تُشارك مع غيره
-            # 🌟 منطق ذكي: إذا كانت افتراضية محذوفة → استعادة | إذا افتراضية مفعّلة → تنبيه | غير ذلك → إضافة
-            _txt = text.strip()
+            # 🔒 خصوصية: الكلمات تُحفظ في قائمة المستخدم الخاص — لا تُشارك مع غيره
+            # 🧩 يقبل عدة كلمات دفعة واحدة (سطر لكل كلمة أو مفصولة بفواصل) — ويمنع تخزين نص طويل/متعدد الأسطر ككلمة واحدة
+            _tokens = parse_keywords_input(text)
+            if not _tokens:
+                await event.respond(
+                    "⚠️ لم أجد كلمة صالحة في رسالتك.\n\n"
+                    "أرسل كلمة واحدة أو عدة كلمات: كل سطر كلمة، أو مفصولة بفواصل `،` أو `,`.\n"
+                    f"💡 الطول الأقصى للكلمة {MAX_KEYWORD_LEN} حرفاً — مثال: `حل واجب`\n"
+                    "💡 للإلغاء أرسل: `/cancel`"
+                )
+                return  # نُبقي الحالة ليعيد الإرسال مباشرة
             _defaults = get_default_keywords(config)
             _deleted = get_user_deleted_defaults(user_id, config)
             my_kw = get_user_keywords(user_id, config)
-            if _txt in _deleted:
-                restore_user_default(user_id, _txt, config)
-                await event.respond(f"♻️ الكلمة `{_txt}` من الكلمات **الافتراضية** كانت محذوفة عندك — **استُعيدت وأصبحت مفعّلة**.")
-            elif _txt in _defaults:
-                await event.respond(f"ℹ️ الكلمة `{_txt}` **افتراضية مفعّلة أصلاً** لكل الحسابات — لا حاجة لإضافتها.")
-            elif _txt in my_kw:
-                await event.respond(f"ℹ️ الكلمة موجودة في قائمتك بالفعل: `{_txt}`")
-            else:
-                my_kw.append(_txt)
+            restored, already_def, exists, added = [], [], [], []
+            for _txt in _tokens:
+                if _txt in _deleted:
+                    restore_user_default(user_id, _txt, config)
+                    restored.append(_txt)
+                elif _txt in _defaults:
+                    already_def.append(_txt)
+                elif _txt in my_kw:
+                    exists.append(_txt)
+                else:
+                    added.append(_txt)
+            if added:
+                my_kw.extend(added)
                 set_user_keywords(user_id, my_kw, config)
-                await event.respond(f"✅ تم إضافة الكلمة إلى قائمتك: `{_txt}`")
+            parts = []
+            if added: parts.append("✅ أُضيفت لقائمتك: `" + "`, `".join(added) + "`")
+            if restored: parts.append("♻️ استُعيدت من الافتراضية المحذوفة عندك: `" + "`, `".join(restored) + "`")
+            if already_def: parts.append("ℹ️ افتراضية مفعّلة أصلاً (لا حاجة للإضافة): `" + "`, `".join(already_def) + "`")
+            if exists: parts.append("ℹ️ موجودة في قائمتك بالفعل: `" + "`, `".join(exists) + "`")
+            await event.respond("\n".join(parts))
             del login_states[user_id]
 
         # إضافة مستخدم للتجاهل
@@ -3741,6 +3791,10 @@ async def main():
     
     # التحقق من إعدادات الفلترة وتحذير المستخدم
     config = load_json_config()
+    # 🧹 تنظيف تلقائي للكلمات المفتاحية المشوهة (نصوص متعددة الأسطر أو أطول من الحد — ناتجة عن لصق رسالة كاملة)
+    if sanitize_keywords_config(config):
+        update_json_config(config)
+        logger.info("🧹 نُظفت كلمات مفتاحية مشوهة من الإعدادات (عامة/خاصة)")
     filters = config.get('FILTERS', {})
     max_len = filters.get('max_length', 0)
     if max_len > 0 and max_len < 200:
