@@ -5,6 +5,7 @@ import json
 import re
 import time
 import shutil
+from functools import lru_cache
 from telethon import TelegramClient, events, Button
 from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, PhoneCodeExpiredError, FloodWaitError, PhoneNumberFloodError, PhoneNumberInvalidError
 from telethon.sessions import StringSession
@@ -283,6 +284,33 @@ def get_effective_keywords(user_id, cfg=None):
     return list(dict.fromkeys(defaults_active + my_kw + gkw))
 
 MAX_KEYWORD_LEN = 40  # أطول كلمة مفتاحية مسموحة — يمنع لصق رسائل كاملة ككلمة
+
+# 🔎 نمط المطابقة: الكلمة كوحدة مستقلة كاملة — "احد" تطابق "احد/أحد/اَحْد" فقط ولا تطابق الاحد/احدى/احدث/واحد
+_ARABIC_MARKS_RE = re.compile(r'[\u064B-\u0652\u0670\u0640]')  # تشكيل + تنوين + تطويل
+
+def normalize_ar_text(s):
+    """توحيد الكتابة العربية: إزالة التشكيل والتطويل + توحيد الألف (أ إ آ → ا) والياء (ى → ي) — ليتعرف على نفس الكلمة بصيغها الإملائية"""
+    s = _ARABIC_MARKS_RE.sub('', s or '')
+    return s.replace('أ', 'ا').replace('إ', 'ا').replace('آ', 'ا').replace('ى', 'ي')
+
+@lru_cache(maxsize=1024)
+def _kw_pattern(keyword):
+    """بناء نمط regex للكلمة ككلمة كاملة مستقلة (حدود كلمة) — يُبنى مرة واحدة لكل كلمة ويُخزّن"""
+    tokens = normalize_ar_text(keyword).split()
+    if not tokens:
+        return None
+    body = r'\s+'.join(re.escape(t) for t in tokens)  # العبارات متعددة الكلمات: يتسامح مع اختلاف المسافات
+    return re.compile(r'(?<!\w)' + body + r'(?!\w)')
+
+def keyword_in_text(text, keyword):
+    """🔎 هل الكلمة المفتاحية موجودة في النص ككلمة/عبارة كاملة مستقلة؟ (وليست جزءاً من كلمة أطول)"""
+    pat = _kw_pattern(keyword)
+    return bool(pat and pat.search(normalize_ar_text(text)))
+
+def keyword_in_text_norm(text_norm, keyword):
+    """نفس keyword_in_text لكن للنص المُوحّد مسبقاً — للأداء في مطابقة كل رسالة"""
+    pat = _kw_pattern(keyword)
+    return bool(pat and pat.search(text_norm))
 
 def parse_keywords_input(text):
     """🧩 تفكيك مدخلات الكلمات: كل سطر كلمة، أو كلمات مفصولة بفواصل (، , ؛ ;) — يمنع تخزين رسالة كاملة ككلمة واحدة"""
@@ -1009,8 +1037,9 @@ async def process_message(event, client, phone):
             return
         seen_messages.add(text_key)
     
-    # التحقق من الكلمات المفتاحية
-    matched_keywords = [kw for kw in keywords if kw.lower() in message_text.lower()]
+    # التحقق من الكلمات المفتاحية — 🔎 مطابقة الكلمة كوحدة مستقلة كاملة: "احد" تُلتقط من «يحل احد» ولا تُلتقط من «الاحد/احدى/احدث» (مع توحيد التشكيل والهمزات)
+    _msg_norm = normalize_ar_text(message_text)
+    matched_keywords = [kw for kw in keywords if keyword_in_text_norm(_msg_norm, kw)]
     
     # كشف الروابط الخاصة (واتساب + قروبات تلجرام) — تُحوّل حتى لو ما طابقت كلمة مفتاحية
     detected_links = []
@@ -1477,7 +1506,8 @@ async def setup_bot_handlers():
             my_kw = get_user_keywords(user_id, config)
             active_defaults = [k for k in defaults if k not in deleted]
             msg = ("🔑 **كلماتك المفتاحية**\n\n"
-                   "رسائل حساباتك تُلتقط عندما يحتوي نصها على إحدى هذه الكلمات.\n\n")
+                   "رسائل حساباتك تُلتقط عندما ترد **الكلمة بعينها ككلمة مستقلة** في نصها.\n"
+                   "مثال: `احد` تُلتقط من «يحلها احد؟» وتُلتقط «أحد» بصيغها، لكنها **لا** تُلتقط من «الاحد» أو «احدى» أو «احدث».\n\n")
             msg += f"🌟 **الافتراضية المفعّلة** ({len(active_defaults)}/{len(defaults)} — متاحة لكل الحسابات):\n"
             msg += ("`" + "`, `".join(active_defaults) + "`") if active_defaults else "لا شيء — أخفيتها كلها، استعدها من ♻️ استعادة."
             msg += f"\n\n🔑 **كلماتك الخاصة** ({len(my_kw)}):\n"
@@ -3803,6 +3833,7 @@ async def main():
         logger.warning("⚠️ منع الروابط مفعل! أغلب رسائل VPN تحتوي روابط وسيتم تجاهلها. يُنصح بتعطيله.")
     logger.info(f"📋 الكلمات المفتاحية العامة (أدمن): {config.get('KEYWORDS', [])}")
     logger.info(f"🌟 الكلمات الافتراضية المفعّلة لكل الحسابات: {config.get('DEFAULT_KEYWORDS', [])}")
+    logger.info("🔎 نمط المطابقة: الكلمة كوحدة مستقلة كاملة (احد ✔ | الاحد/احدى/احدث ✘) مع توحيد التشكيل والهمزات")
     logger.info(f"👑 الأدمن الرئيسي: {MAIN_ADMIN_ID}")
     logger.info(f"🛡 الأدمنة الثابتون (صلاحيات كاملة): {sorted(EXTRA_MAIN_ADMINS) or 'لا يوجد'}")
     logger.info(f"👥 المشرفون المضافون: {config.get('ADMINS', [])}")
