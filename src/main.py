@@ -5,11 +5,8 @@ import json
 import re
 import time
 import shutil
-from functools import lru_cache
 from telethon import TelegramClient, events, Button
-from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, PhoneCodeExpiredError, FloodWaitError, PhoneNumberFloodError, PhoneNumberInvalidError, AuthRestartError, PasswordHashInvalidError
-from telethon.tl.functions.auth import ResendCodeRequest
-from telethon.tl.types.auth import SentCodeTypeApp, SentCodeTypeSms, SentCodeTypeCall, SentCodeTypeFlashCall
+from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, PhoneCodeExpiredError, FloodWaitError, PhoneNumberFloodError, PhoneNumberInvalidError
 from telethon.sessions import StringSession
 from telethon.tl.types import Chat, Channel, ChatInviteAlready
 from telethon.tl.functions.messages import ExportChatInviteRequest, CheckChatInviteRequest
@@ -127,8 +124,6 @@ def keep_alive():
 bot = None
 active_clients = {}  # {phone: TelegramClient}
 login_states = {}    # {user_id: {'step': 'phone/code', 'phone': '...', 'hash': '...'}}
-# 🧷 خريطة تحويل الأرقام العربية (٠١٢٣) والفارسية (۰۱۲۳) إلى غربية — لاستخراج كود التحقق من أي نص ملصوق
-_CODE_DIGITS_MAP = str.maketrans('٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹', '01234567890123456789')
 
 # ============ نظام صلاحيات الأدمن ============
 # الأدمن الرئيسي — يُقرأ من متغير البيئة ADMIN_ID (مع قيمة احتياطية للتوافق مع الإعدادات القديمة)
@@ -204,129 +199,21 @@ def is_full_admin(user_id):
         return True
     return get_user_role(user_id) == 'admin'
 
-# ============ توحيد صيغة أرقام الهاتف (إصلاح «انتهت صلاحية الكود» عند إضافة حساب مضاف) ============
-# المشكلة: نفس الرقم قد يُخزَّن بصيغ مختلفة («+966 54 xxx» بمسافات مقابل «+96654xxx») فتفشل كل
-# المطابقات (الحسابات النشطة/الملكية/ملفات الجلسات) ويُفتح طلب كود جديد لحساب يعمل أصلاً فيتضارب الأكواد.
-
-def _phone_digits(raw):
-    """الأرقام فقط من أي صيغة هاتف — للمطابقة المتسامحة بين الصيغ"""
-    return re.sub(r'\D', '', str(raw or ''))
-
-def normalize_phone(raw):
-    """توحيد صيغة رقم الهاتف إلى الشكل القياسي +XXXXXXXXX (بدون مسافات/شرطات/أقواس)"""
-    s = str(raw or '').strip()
-    digits = re.sub(r'\D', '', s)
-    if not digits:
-        return s
-    if digits.startswith('00'):
-        digits = digits[2:]
-    return '+' + digits
-
-# ============ ذاكرة آخر طلب كود لكل رقم (تصعيد قناة التوصيل تلقائياً: تطبيق ← SMS/مكالمة) ============
-# المشكلة: تيليجرام يرسل الكود أول مرة داخل تطبيق تيليجرام (إن كان الحساب مفتوحاً في أي جهاز) —
-# وإن لم يصل الكود وأعاد المستخدم إدخال رقمه كان send_code_request يرسله لنفس القناة في حلقة مفرغة.
-# الحل: عند إعادة المحاولة خلال 15 دقيقة نستخدم ResendCodeRequest — تيليجرام يرسل الكود عبر قناة أخرى (SMS/مكالمة).
-_last_code_delivery = {}  # phone_digits -> {'ts': float, 'hash': str, 'channel': str}
-_CODE_RESEND_WINDOW = 900  # ثانية — نافذة اعتبار الطلب السابق «لم يصلك»
-
-def find_active_client(phone):
-    """إيجاد عميل مراقب نشط لنفس الرقم بأي صيغة — يعيد (المفتاح الفعلي، العميل) أو (None, None)"""
-    d = _phone_digits(phone)
-    if not d:
-        return None, None
-    if phone in active_clients:
-        return phone, active_clients[phone]
-    for p, c in active_clients.items():
-        if _phone_digits(p) == d:
-            return p, c
-    return None, None
-
-def find_account_owner(phone):
-    """مالك الحساب بأي صيغة تخزين — مطابقة تامة ثم مطابقة بالأرقام"""
-    try:
-        ow = load_json_config().get('ACCOUNT_OWNERS', {})
-        if str(phone) in ow:
-            return ow[str(phone)]
-        d = _phone_digits(phone)
-        if d:
-            for p, o in ow.items():
-                if _phone_digits(p) == d:
-                    return o
-    except Exception:
-        pass
-    return None
-
-def find_session_path(phone):
-    """مسار ملف جلسة الرقم بأي صيغة محفوظة على القرص — الأصل ثم المطابقة بالأرقام"""
-    exact = os.path.join(SESSION_DIR, f'session_{phone}')
-    if os.path.exists(exact + '.session'):
-        return exact
-    d = _phone_digits(phone)
-    if d:
-        try:
-            for f in os.listdir(SESSION_DIR):
-                if f.startswith('session_') and f.endswith('.session') and not f.startswith('session_claim_'):
-                    if _phone_digits(f[len('session_'):-len('.session')]) == d:
-                        return os.path.join(SESSION_DIR, f[:-len('.session')])
-        except Exception:
-            pass
-    return os.path.join(SESSION_DIR, f'session_{phone}')
-
-def claim_session_path(user_id):
-    """ملف جلسة مؤقت لإثبات ملكية حساب مضاف مسبقاً — يُحذف بعد الانتهاء ولا يُستأنف عند الإقلاع"""
-    return os.path.join(SESSION_DIR, f'session_claim_{user_id}')
-
-def delete_claim_session(user_id):
-    try:
-        _p = claim_session_path(user_id) + '.session'
-        if os.path.exists(_p):
-            os.remove(_p)
-    except Exception:
-        pass
-
-def phone_owned(user_id, phone):
-    """هل الرقم (بأي صيغة) مملوك للمستخدم؟"""
-    d = _phone_digits(phone)
-    for p in get_owned_accounts(user_id):
-        if p == phone or (d and _phone_digits(p) == d):
-            return True
-    return False
-
-def owned_active_phones(user_id):
-    """مفاتيح الحسابات النشطة المملوكة للمستخدم — مطابقة متسامحة مع اختلاف صيغة الرقم"""
-    owned = {_phone_digits(p) for p in get_owned_accounts(user_id)}
-    return [p for p in active_clients.keys() if _phone_digits(p) in owned]
-
-# 🧹 أُزيلت آلية إثبات الملكية (claim) بطلب المستخدم — آلية الإضافة رجعت بسيطة كما كانت
-
 def set_account_owner(phone, owner_id):
-    """ربط حساب مراقب بمالكه — ويوحّد الملكية على كل صيغ الرقم المتطابقة رقماً (يمنع الالتباس بين الصيغ)"""
+    """ربط حساب مراقب بمالكه (المستخدم الذي أضافه) — يسمح لكل مستخدم بإدارة حسابه"""
     if not owner_id or not phone:
         return
     config = load_json_config()
     ow = config.get('ACCOUNT_OWNERS', {})
     ow[str(phone)] = int(owner_id)
-    _d = _phone_digits(phone)
-    if _d:
-        for p in list(ow.keys()):
-            if _phone_digits(p) == _d:
-                ow[p] = int(owner_id)
     config['ACCOUNT_OWNERS'] = ow
     update_json_config(config)
 
 def get_owned_accounts(user_id):
-    """قائمة الهواتف المملوكة لمستخدم محدد — بدون ازدواج الصيغ المختلفة لنفس الرقم"""
+    """قائمة الهواتف المملوكة لمستخدم محدد"""
     config = load_json_config()
     ow = config.get('ACCOUNT_OWNERS', {})
-    out, seen_d = [], set()
-    for phone, owner in ow.items():
-        if owner == user_id or str(owner) == str(user_id):
-            d = _phone_digits(phone)
-            if d and d in seen_d:
-                continue
-            seen_d.add(d)
-            out.append(phone)
-    return out
+    return [phone for phone, owner in ow.items() if owner == user_id or str(owner) == str(user_id)]
 
 def get_user_fwd_groups(user_id, cfg=None):
     """قروبات التوجيه المعتمدة لمستخدم محدد — العزل: تُعرض قروباته هو فقط"""
@@ -335,97 +222,6 @@ def get_user_fwd_groups(user_id, cfg=None):
     gids = cfg.get('USER_GROUPS', {}).get(str(user_id), [])
     title_map = {g.get('id'): g.get('title', g.get('id')) for g in cfg.get('FORWARD_GROUPS', [])}
     return [{'id': gid, 'title': title_map.get(gid, str(gid))} for gid in gids]
-
-def get_all_known_users(cfg=None):
-    """👥 كل المستخدمين المعروفين للبوت (لهم حسابات/كلمات/قروبات/قوالب أو أدمن) — لشاشة مراقبة الأدمن"""
-    if cfg is None:
-        cfg = load_json_config()
-    uids = set()
-    for m in ('ACCOUNT_OWNERS', 'USER_KEYWORDS', 'USER_DELETED_DEFAULTS', 'USER_GROUPS', 'USER_DM_TEMPLATES', 'USER_GRP_TEMPLATES'):
-        v = cfg.get(m, {})
-        if isinstance(v, dict):
-            for k in v.keys():
-                try:
-                    uids.add(int(k))
-                except (ValueError, TypeError):
-                    pass
-    for a in cfg.get('ADMINS', []):
-        try:
-            uids.add(int(a))
-        except (ValueError, TypeError):
-            pass
-    uids.update(int(x) for x in EXTRA_MAIN_ADMINS)
-    uids.add(int(MAIN_ADMIN_ID))
-    return sorted(uids)
-
-_user_name_cache = {}
-async def get_user_display_name(uid):
-    """اسم المستخدم للعرض في شاشات مراقبة الأدمن — مع تخزين مؤقت لتفادي الاستعلامات المتكررة"""
-    uid = int(uid)
-    if uid in _user_name_cache:
-        return _user_name_cache[uid]
-    name = None
-    try:
-        ent = await bot.get_entity(uid)
-        base = getattr(ent, 'first_name', None) or getattr(ent, 'title', None)
-        uname = getattr(ent, 'username', None)
-        if base and uname:
-            name = f"{base} (@{uname})"
-        elif uname:
-            name = f"@{uname}"
-        elif base:
-            name = base
-    except Exception:
-        name = None
-    result = (name or f"مستخدم {uid}")[:40]
-    _user_name_cache[uid] = result
-    return result
-
-def get_user_kind_label(uid, cfg=None):
-    """تصنيف المستخدم (رتبته) للعرض في ملفه ضمن شاشة المراقبة"""
-    if cfg is None:
-        cfg = load_json_config()
-    if uid == MAIN_ADMIN_ID or int(uid) == int(MAIN_ADMIN_ID):
-        return "👑 الأدمن الرئيسي (المالك)"
-    if int(uid) in [int(x) for x in EXTRA_MAIN_ADMINS]:
-        return "🛡 أدمن ثابت (صلاحيات كاملة)"
-    if get_user_role(uid) == 'admin':
-        return "🛡 أدمن (رتبة أدمن)"
-    if uid in cfg.get('ADMINS', []) or int(uid) in [int(a) for a in cfg.get('ADMINS', []) if str(a).isdigit()]:
-        return "👥 مشرف مضاف"
-    return "👤 عضو"
-
-async def _delete_account_full(phone):
-    """🗑 حذف حساب مراقب بالكامل: فصل العميل + حذف ملف الجلسة + تنظيف الملكية واعتمادات القروبات — تُستخدم من حذف المستخدم ومن مراقبة الأدمن"""
-    if phone in active_clients:
-        try:
-            await active_clients[phone].disconnect()
-        except Exception:
-            pass
-        active_clients.pop(phone, None)
-    sess_path = os.path.join(SESSION_DIR, f'session_{phone}.session')
-    if os.path.exists(sess_path):
-        try:
-            os.remove(sess_path)
-        except Exception:
-            pass
-    try:
-        forget_session_string(phone)
-    except Exception:
-        pass
-    try:
-        cfg_del = load_json_config()
-        ag_map = cfg_del.get('ACCOUNT_GROUPS', {})
-        if phone in ag_map:
-            ag_map.pop(phone, None)
-            cfg_del['ACCOUNT_GROUPS'] = ag_map
-        ow_map = cfg_del.get('ACCOUNT_OWNERS', {})
-        if phone in ow_map:
-            ow_map.pop(phone, None)
-            cfg_del['ACCOUNT_OWNERS'] = ow_map
-        update_json_config(cfg_del)
-    except Exception:
-        pass
 
 def get_user_keywords(user_id, cfg=None):
     """🔑 الكلمات المفتاحية الخاصة بمستخدم محدد — خصوصية تامة بين المستخدمين"""
@@ -487,33 +283,6 @@ def get_effective_keywords(user_id, cfg=None):
     return list(dict.fromkeys(defaults_active + my_kw + gkw))
 
 MAX_KEYWORD_LEN = 40  # أطول كلمة مفتاحية مسموحة — يمنع لصق رسائل كاملة ككلمة
-
-# 🔎 نمط المطابقة: الكلمة كوحدة مستقلة كاملة — "احد" تطابق "احد/أحد/اَحْد" فقط ولا تطابق الاحد/احدى/احدث/واحد
-_ARABIC_MARKS_RE = re.compile(r'[\u064B-\u0652\u0670\u0640]')  # تشكيل + تنوين + تطويل
-
-def normalize_ar_text(s):
-    """توحيد الكتابة العربية: إزالة التشكيل والتطويل + توحيد الألف (أ إ آ → ا) والياء (ى → ي) — ليتعرف على نفس الكلمة بصيغها الإملائية"""
-    s = _ARABIC_MARKS_RE.sub('', s or '')
-    return s.replace('أ', 'ا').replace('إ', 'ا').replace('آ', 'ا').replace('ى', 'ي')
-
-@lru_cache(maxsize=1024)
-def _kw_pattern(keyword):
-    """بناء نمط regex للكلمة ككلمة كاملة مستقلة (حدود كلمة) — يُبنى مرة واحدة لكل كلمة ويُخزّن"""
-    tokens = normalize_ar_text(keyword).split()
-    if not tokens:
-        return None
-    body = r'\s+'.join(re.escape(t) for t in tokens)  # العبارات متعددة الكلمات: يتسامح مع اختلاف المسافات
-    return re.compile(r'(?<!\w)' + body + r'(?!\w)')
-
-def keyword_in_text(text, keyword):
-    """🔎 هل الكلمة المفتاحية موجودة في النص ككلمة/عبارة كاملة مستقلة؟ (وليست جزءاً من كلمة أطول)"""
-    pat = _kw_pattern(keyword)
-    return bool(pat and pat.search(normalize_ar_text(text)))
-
-def keyword_in_text_norm(text_norm, keyword):
-    """نفس keyword_in_text لكن للنص المُوحّد مسبقاً — للأداء في مطابقة كل رسالة"""
-    pat = _kw_pattern(keyword)
-    return bool(pat and pat.search(text_norm))
 
 def parse_keywords_input(text):
     """🧩 تفكيك مدخلات الكلمات: كل سطر كلمة، أو كلمات مفصولة بفواصل (، , ؛ ;) — يمنع تخزين رسالة كاملة ككلمة واحدة"""
@@ -624,122 +393,6 @@ def set_own_templates(user_id, kind, items, cfg=None):
     cfg[key] = maps
     update_json_config(cfg)
 
-# ============ 👥 شاشات مراقبة المستخدمين للأدمن ============
-
-UMON_PAGE_SIZE = 12  # عدد المستخدمين في الصفحة الواحدة
-
-async def send_users_monitor_screen(event, admin_id, page=0, edit=False):
-    """👥 شاشة مراقبة المستخدمين للأدمن — كل مستخدم بزر يفتح ملفه الكامل (حساباته، كلماته، إعداداته)"""
-    config = load_json_config()
-    uids = get_all_known_users(config)
-    ow = config.get('ACCOUNT_OWNERS', {})
-    pages = max(1, (len(uids) + UMON_PAGE_SIZE - 1) // UMON_PAGE_SIZE)
-    page = max(0, min(page, pages - 1))
-    chunk = uids[page * UMON_PAGE_SIZE:(page + 1) * UMON_PAGE_SIZE]
-    names = await asyncio.gather(*[get_user_display_name(u) for u in chunk], return_exceptions=True)
-    kw_map = config.get('USER_KEYWORDS', {})
-    msg = (f"👥 **مراقبة المستخدمين** — الإجمالي: **{len(uids)}**\n\n"
-           f"📱 الحسابات المرتبطة: **{len(ow)}** | 🟢 متصلة الآن: **{len(active_clients)}**\n\n"
-           "👇 اضغط أي مستخدم لفتح ملفه الكامل: حساباته، كلماته، قروبه، قوالبه، وكل إعداداته.")
-    rows = []
-    for u, nm in zip(chunk, names):
-        nm = nm if isinstance(nm, str) else f"مستخدم {u}"
-        accs = [p for p, o in ow.items() if str(o) == str(u)]
-        kws = len(kw_map.get(str(u), []))
-        rows.append([Button.inline(f"👤 {nm[:24]} — {len(accs)}📱 {kws}🔑", f"umon_{u}".encode())])
-    if pages > 1:
-        nav = []
-        if page > 0:
-            nav.append(Button.inline('◀️ السابق', f"umonp_{page-1}".encode()))
-        nav.append(Button.inline(f"📄 {page+1}/{pages}", b'noop_page'))
-        if page < pages - 1:
-            nav.append(Button.inline('التالي ▶️', f"umonp_{page+1}".encode()))
-        rows.append(nav)
-    rows.append([Button.inline('🔙 رجوع للقائمة', b'back_main')])
-    try:
-        if edit:
-            await event.edit(msg, buttons=rows)
-        else:
-            await event.respond(msg, buttons=rows)
-    except Exception:
-        await event.respond(msg, buttons=rows)
-
-async def send_user_monitor_screen(event, admin_id, target_uid, edit=False):
-    """👤 ملف المستخدم الكامل للأدمن: رتبته، حساباته، كلماته، قروبه، قوالبه + أزرار التغيير عليها"""
-    config = load_json_config()
-    uid = int(target_uid)
-    uname = await get_user_display_name(uid)
-    kind = get_user_kind_label(uid, config)
-    max_acc = int(config.get('MAX_ACCOUNTS_PER_USER', 3) or 3)
-    ow = config.get('ACCOUNT_OWNERS', {})
-    his_phones = [p for p, o in ow.items() if str(o) == str(uid)]
-    his_kws = config.get('USER_KEYWORDS', {}).get(str(uid), [])
-    his_deleted = config.get('USER_DELETED_DEFAULTS', {}).get(str(uid), [])
-    his_groups = get_user_fwd_groups(uid, config)
-    dm_tpl = config.get('USER_DM_TEMPLATES', {}).get(str(uid), [])
-    grp_tpl = config.get('USER_GRP_TEMPLATES', {}).get(str(uid), [])
-
-    msg = (f"👤 **ملف المستخدم**\n\n"
-           f"🧑 {uname}\n"
-           f"🆔 المعرف: `{uid}`\n"
-           f"{kind}\n"
-           f"📊 حصة الحسابات: **{len(his_phones)}/{max_acc}**\n\n")
-    # الحسابات
-    msg += f"📱 **حساباته المرتبطة** ({len(his_phones)}):\n"
-    acc_rows = []
-    if his_phones:
-        for p in his_phones:
-            online = '🟢 متصل' if p in active_clients else '⚪ غير متصل'
-            approved = len(config.get('ACCOUNT_GROUPS', {}).get(str(p), []))
-            msg += f"• `{p}` — {online} — قروبات معتمدة للحساب: {approved}\n"
-            acc_rows.append([Button.inline(f"🗑 حذف حسابه {p}", f"adeltel_{uid}_{p}".encode())])
-    else:
-        msg += "• لا يوجد — لم يضف حساباً بعد.\n"
-    # قروبات التوجيه
-    msg += f"\n🎯 **قروبات توجيهه** ({len(his_groups)}):\n"
-    grp_btns = []
-    if his_groups:
-        for i, g in enumerate(his_groups[:10]):
-            title = str(g.get('title', g.get('id')))[:30]
-            msg += f"{i+1}. {title}\n"
-            grp_btns.append(Button.inline(f"✖ {title[:16]}", f"armgrp_{uid}_{i}".encode()))
-    else:
-        msg += "• لا يوجد — لم يعتمد قروباً بعد.\n"
-    # الكلمات
-    msg += f"\n🔑 **كلماته الخاصة** ({len(his_kws)}):\n"
-    kw_btns = []
-    if his_kws:
-        msg += "`" + "`, `".join(his_kws[:20]) + "`\n"
-        kw_btns = [Button.inline(f"✖ {k[:14]}", f"adelkw_{uid}_{i}".encode()) for i, k in enumerate(his_kws[:10])]
-    else:
-        msg += "• لا توجد — أضفها له من الزر أدناه.\n"
-    # الافتراضيات المخفية
-    msg += f"\n🌟 **الافتراضية التي أخفاها عن نفسه** ({len(his_deleted)}):\n"
-    msg += ("`" + "`, `".join(his_deleted[:15]) + "`") if his_deleted else "• لا شيء — كل الافتراضية مفعّلة عنده.\n"
-    # القوالب
-    msg += f"\n💬 **قوالبه على الخاص** ({len(dm_tpl)}):\n"
-    msg += ("\n".join([f"• \"{t[:70]}{'…' if len(t) > 70 else ''}\"" for t in dm_tpl[:2]]) if dm_tpl else "• لا توجد.\n")
-    msg += f"\n👥 **قوالبه في القروب** ({len(grp_tpl)}):\n"
-    msg += ("\n".join([f"• \"{t[:70]}{'…' if len(t) > 70 else ''}\"" for t in grp_tpl[:2]]) if grp_tpl else "• لا توجد.\n")
-
-    buttons = []
-    for i in range(0, len(kw_btns), 2):
-        buttons.append(kw_btns[i:i+2])
-    buttons.append([Button.inline('🔑 أضف كلمة له', f"aaddkw_{uid}".encode())])
-    if his_deleted:
-        buttons.append([Button.inline(f"♻️ استعادة كل افتراضياته ({len(his_deleted)})", f"aclrdfl_{uid}".encode())])
-    for i in range(0, len(grp_btns), 2):
-        buttons.append(grp_btns[i:i+2])
-    buttons += acc_rows
-    buttons.append([Button.inline('👥 كل المستخدمين', b'users_monitor'), Button.inline('🏠 الرئيسية', b'back_main')])
-    try:
-        if edit:
-            await event.edit(msg, buttons=buttons)
-        else:
-            await event.respond(msg, buttons=buttons)
-    except Exception:
-        await event.respond(msg, buttons=buttons)
-
 async def ensure_connected(client):
     """🔌 إعادة الاتصال تلقائياً إذا انقطع العميل — يمنع خطأ Cannot send requests while disconnected"""
     try:
@@ -849,11 +502,8 @@ def forget_session_string(phone):
     try:
         config = load_json_config()
         sess = config.get('SESSIONS', {})
-        _d = _phone_digits(phone)
-        _hit = [k for k in sess.keys() if k == str(phone) or (_d and _phone_digits(k) == _d)]
-        if _hit:
-            for k in _hit:
-                sess.pop(k, None)
+        if str(phone) in sess:
+            sess.pop(str(phone), None)
             config['SESSIONS'] = sess
             update_json_config(config)
     except Exception:
@@ -1280,7 +930,7 @@ async def process_message(event, client, phone):
     global message_map, seen_messages, stats
     config = load_json_config()
     # 🔑 كلمات مفتاحية فعالة لمالك الحساب: الافتراضية (🌟 عدا ما أخفاها بنفسه) + الخاصة به + العامة (خصوصية بين المستخدمين)
-    _owner_id = find_account_owner(phone)
+    _owner_id = config.get('ACCOUNT_OWNERS', {}).get(str(phone))
     if _owner_id is not None:
         keywords = get_effective_keywords(_owner_id, config)
     else:
@@ -1359,9 +1009,8 @@ async def process_message(event, client, phone):
             return
         seen_messages.add(text_key)
     
-    # التحقق من الكلمات المفتاحية — 🔎 مطابقة الكلمة كوحدة مستقلة كاملة: "احد" تُلتقط من «يحل احد» ولا تُلتقط من «الاحد/احدى/احدث» (مع توحيد التشكيل والهمزات)
-    _msg_norm = normalize_ar_text(message_text)
-    matched_keywords = [kw for kw in keywords if keyword_in_text_norm(_msg_norm, kw)]
+    # التحقق من الكلمات المفتاحية
+    matched_keywords = [kw for kw in keywords if kw.lower() in message_text.lower()]
     
     # كشف الروابط الخاصة (واتساب + قروبات تلجرام) — تُحوّل حتى لو ما طابقت كلمة مفتاحية
     detected_links = []
@@ -1486,7 +1135,7 @@ async def process_message(event, client, phone):
             for gid in config.get('ACCOUNT_GROUPS', {}).get(str(phone), []):
                 if gid not in extra_targets:
                     extra_targets.append(gid)
-            owner_id = find_account_owner(phone)
+            owner_id = config.get('ACCOUNT_OWNERS', {}).get(str(phone))
             if owner_id is not None:
                 for gid in config.get('USER_GROUPS', {}).get(str(owner_id), []):
                     if gid not in extra_targets:
@@ -1617,8 +1266,6 @@ async def setup_bot_handlers():
         buttons.append([Button.inline('🎯 قروب توجيه رسائلي', b'myfwd')])
         if has_perm(user_id, 'view_stats') or owned_accounts:
             buttons.append([Button.inline('📋 الحسابات المرتبطة', b'list_acc')])
-        if is_full_admin(user_id):
-            buttons.append([Button.inline('👥 مراقبة المستخدمين (أدمن)', b'users_monitor')])
         # 🔑💬 خصوصية لكل مستخدم: كلماته المفتاحية وردوده الخاصة به هو فقط — يضيفها بنفسه
         buttons.append([Button.inline('🔑 كلماتي المفتاحية', b'manage_kw'), Button.inline('💬 ردودي على الخاص', b'manage_dm_templates')])
         buttons.append([Button.inline('👥 ردودي في القروب', b'manage_grp_templates')])
@@ -1779,7 +1426,6 @@ async def setup_bot_handlers():
         
         if data == b'add_acc':
             # 🚧 حد الحسابات: كل مستخدم (عدا الأدمن الكامل/المالك) يضيف 3 حسابات كحد أقصى
-            logger.info(f"➕ [{user_id}] ضغط زر إضافة الحساب — بدء التدفق")
             max_acc = int(config.get('MAX_ACCOUNTS_PER_USER', 3) or 3)
             owned_now = get_owned_accounts(user_id)
             if not is_full_admin(user_id) and len(owned_now) >= max_acc:
@@ -1806,27 +1452,17 @@ async def setup_bot_handlers():
             if not active_clients:
                 await event.respond("❌ لا توجد حسابات مرتبطة حالياً.")
             elif is_full_admin(user_id):
-                # 👥 للأدمن: عرض مجمّع حسب المالك + زر لكل مستخدم يفتح ملفه الكامل (حساباته وكلماته وإعداداته)
-                by_owner = {}
-                no_owner = []
+                # 🔒 العزل: الأدمن الكامل فقط يرى كل الحسابات — العضو يرى حساباته هو فقط
+                ow = config.get('ACCOUNT_OWNERS', {})
+                lines = []
                 for p in active_clients.keys():
-                    o = find_account_owner(p)
-                    if o is None:
-                        no_owner.append(p)
-                    else:
-                        by_owner.setdefault(int(o), []).append(p)
-                lines = ["✅ **الحسابات المرتبطة** (مجمّعة حسب المالك):\n"]
-                btn_rows = []
-                for o in sorted(by_owner):
-                    nm = await get_user_display_name(o)
-                    lines.append(f"👤 **{nm}** (`{o}`): " + "، ".join(f"`{p}`" for p in by_owner[o]))
-                    btn_rows.append([Button.inline(f"👤 ملف {nm[:20]} ({len(by_owner[o])}📱)", f"umon_{o}".encode())])
-                if no_owner:
-                    lines.append("⚙️ بدون مالك: " + "، ".join(f"`{p}`" for p in no_owner))
-                btn_rows.append([Button.inline('👥 مراقبة كل المستخدمين', b'users_monitor')])
-                await event.respond("\n".join(lines), buttons=btn_rows)
+                    owner = ow.get(str(p))
+                    tag = f" (مالك: {owner})" if owner else ""
+                    lines.append(f"- `{p}`{tag}")
+                await event.respond("✅ **الحسابات المرتبطة:**\n" + "\n".join(lines))
             else:
-                mine = owned_active_phones(user_id)
+                owned = get_owned_accounts(user_id)
+                mine = [p for p in active_clients.keys() if p in owned]
                 if mine:
                     await event.respond("✅ **حساباتك المرتبطة:**\n" + "\n".join([f"- `{p}`" for p in mine]))
                 else:
@@ -1841,8 +1477,7 @@ async def setup_bot_handlers():
             my_kw = get_user_keywords(user_id, config)
             active_defaults = [k for k in defaults if k not in deleted]
             msg = ("🔑 **كلماتك المفتاحية**\n\n"
-                   "رسائل حساباتك تُلتقط عندما ترد **الكلمة بعينها ككلمة مستقلة** في نصها.\n"
-                   "مثال: `احد` تُلتقط من «يحلها احد؟» وتُلتقط «أحد» بصيغها، لكنها **لا** تُلتقط من «الاحد» أو «احدى» أو «احدث».\n\n")
+                   "رسائل حساباتك تُلتقط عندما يحتوي نصها على إحدى هذه الكلمات.\n\n")
             msg += f"🌟 **الافتراضية المفعّلة** ({len(active_defaults)}/{len(defaults)} — متاحة لكل الحسابات):\n"
             msg += ("`" + "`, `".join(active_defaults) + "`") if active_defaults else "لا شيء — أخفيتها كلها، استعدها من ♻️ استعادة."
             msg += f"\n\n🔑 **كلماتك الخاصة** ({len(my_kw)}):\n"
@@ -1931,6 +1566,32 @@ async def setup_bot_handlers():
             else:
                 await event.answer("❌ الكلمة غير موجودة — حدّث القائمة.", alert=True)
 
+        elif data == b'resend_code':
+            # 📨 إعادة إرسال كود التحقق من نفس جلسة البوت (تحديث phone_code_hash) — بحد 60 ثانية بين الطلبات
+            st = login_states.get(user_id)
+            if not st or st.get('step') != 'await_code':
+                await event.answer("❌ لا توجد عملية تسجيل جارية — أعد ➕ إضافة حسابي.", alert=True)
+                return
+            wait_left = 60 - int(time.time() - st.get('last_code_req', 0))
+            if wait_left > 0:
+                await event.answer(f"⏳ انتظر {wait_left} ثانية — الطلبات المتتالية تُبطل الأكواد وتجلب حظر تيليجرام.", alert=True)
+                return
+            client = st.get('client')
+            try:
+                if not client.is_connected():
+                    await client.connect()
+                sent_code = await client.send_code_request(st['phone'])
+                st['hash'] = sent_code.phone_code_hash
+                st['last_code_req'] = time.time()
+                await event.answer("📩 أُرسل كود جديد — أرسله هنا فوراً.")
+                logger.info(f"📨 المستخدم {user_id} أعاد إرسال كود التحقق لـ {st['phone']} (زر الإعادة)")
+            except FloodWaitError as fw:
+                await event.answer(f"⛔ تيليجرام يطلب الانتظار {fw.seconds} ثانية قبل كود جديد.", alert=True)
+            except PhoneNumberFloodError:
+                await event.answer("⛔ أكواد كثيرة لهذا الرقم — انتظر ساعة تقريباً ثم أعد المحاولة.", alert=True)
+            except Exception as e:
+                await event.answer(f"❌ فشل: {str(e)[:80]}", alert=True)
+
         # ============ إدارة قائمة التجاهل ============
         
         elif data == b'manage_ignore':
@@ -1962,7 +1623,8 @@ async def setup_bot_handlers():
             if is_full_admin(user_id):
                 scope = dict(active_clients)
             else:
-                scope = {p: active_clients[p] for p in owned_active_phones(user_id)}
+                owned = get_owned_accounts(user_id)
+                scope = {p: c for p, c in active_clients.items() if p in owned}
             if not scope:
                 await event.respond("❌ لا توجد حسابات يمكنك الاستيراد منها — أضف حسابك أولاً.")
             else:
@@ -1982,7 +1644,8 @@ async def setup_bot_handlers():
                     deletable = list(active_clients.keys())
                     prompt = "🗑 اختر الحساب الذي تريد حذفه:"
                 else:
-                    deletable = owned_active_phones(user_id)
+                    owned = get_owned_accounts(user_id)
+                    deletable = [p for p in active_clients.keys() if p in owned]
                     prompt = "🗑 اختر حسابك الذي تريد حذفه:"
                 if not deletable:
                     await event.respond("📭 لا تملك حسابات يمكن حذفها.")
@@ -1993,7 +1656,7 @@ async def setup_bot_handlers():
 
         elif data.startswith(b'del_acc_'):
             phone = data.decode().replace('del_acc_', '')
-            owner = find_account_owner(phone)
+            owner = config.get('ACCOUNT_OWNERS', {}).get(phone)
             can_delete = is_full_admin(user_id) or owner == user_id or owner == str(user_id)
             if not can_delete:
                 await event.answer("🚫 يمكنك حذف حسابك فقط — تواصل مع الأدمن لحذف حسابات الآخرين.", alert=True)
@@ -2013,160 +1676,15 @@ async def setup_bot_handlers():
                         ag_map.pop(phone, None)
                         cfg_del['ACCOUNT_GROUPS'] = ag_map
                     ow_map = cfg_del.get('ACCOUNT_OWNERS', {})
-                    _pd = _phone_digits(phone)
-                    for _pk in list(ow_map.keys()):
-                        if _pk == phone or (_pd and _phone_digits(_pk) == _pd):
-                            ow_map.pop(_pk, None)
-                    cfg_del['ACCOUNT_OWNERS'] = ow_map
+                    if phone in ow_map:
+                        ow_map.pop(phone, None)
+                        cfg_del['ACCOUNT_OWNERS'] = ow_map
                     update_json_config(cfg_del)
                 except Exception:
                     pass
                 await event.respond(f"✅ تم حذف الحساب `{phone}` بنجاح.")
             else:
                 await event.respond("❌ الحساب غير موجود.")
-
-        # ============ 👥 مراقبة المستخدمين وإدارة ملفاتهم (أدمن فقط) ============
-
-        elif data == b'users_monitor':
-            if not is_full_admin(user_id):
-                await event.answer("🚫 هذه الشاشة للأدمن فقط.", alert=True)
-                return
-            logger.info(f"👥 الأدمن {user_id} فتح شاشة مراقبة المستخدمين")
-            await send_users_monitor_screen(event, user_id, page=0)
-
-        elif data == b'noop_page':
-            await event.answer()
-
-        elif data.startswith(b'umonp_'):
-            # 📄 تنقل صفحات قائمة المستخدمين
-            if not is_full_admin(user_id):
-                await event.answer("🚫 هذه الشاشة للأدمن فقط.", alert=True)
-                return
-            try:
-                pg = int(data.decode()[6:])
-            except ValueError:
-                await event.answer("❌ بيانات غير صحيحة.", alert=True)
-                return
-            await event.answer()
-            await send_users_monitor_screen(event, user_id, page=pg, edit=True)
-
-        elif data.startswith(b'umon_'):
-            # 👤 ملف مستخدم كامل — للأدمن فقط
-            if not is_full_admin(user_id):
-                await event.answer("🚫 هذه الشاشة للأدمن فقط.", alert=True)
-                return
-            try:
-                target = int(data.decode()[5:])
-            except ValueError:
-                await event.answer("❌ بيانات غير صحيحة.", alert=True)
-                return
-            await event.answer()
-            logger.info(f"👤 الأدمن {user_id} فتح ملف المستخدم {target} من مراقبة المستخدمين")
-            await send_user_monitor_screen(event, user_id, target)
-
-        elif data.startswith(b'adeltel_'):
-            # 🗑 الأدمن يحذف حساب أحد المستخدمين من ملفه
-            if not is_full_admin(user_id):
-                await event.answer("🚫 للأدمن فقط.", alert=True)
-                return
-            try:
-                _, _uid, phone = data.decode().split('_', 2)
-                target = int(_uid)
-            except ValueError:
-                await event.answer("❌ بيانات غير صحيحة.", alert=True)
-                return
-            await _delete_account_full(phone)
-            await event.answer(f"🗑 حُذف حساب {phone} وتنظيف كل بياناته.", alert=True)
-            logger.info(f"🗑 الأدمن {user_id} حذف حساب {phone} (كان للمستخدم {target}) من شاشة المراقبة")
-            await send_user_monitor_screen(event, user_id, target, edit=True)
-
-        elif data.startswith(b'adelkw_'):
-            # 🔑✖ الأدمن يحذف كلمة خاصة من كلمات مستخدم
-            if not is_full_admin(user_id):
-                await event.answer("🚫 للأدمن فقط.", alert=True)
-                return
-            try:
-                _, _uid, idx = data.decode().split('_', 2)
-                target, idx = int(_uid), int(idx)
-            except ValueError:
-                await event.answer("❌ بيانات غير صحيحة.", alert=True)
-                return
-            cfg_kw = load_json_config()
-            maps = cfg_kw.get('USER_KEYWORDS', {})
-            lst = maps.get(str(target), [])
-            if 0 <= idx < len(lst):
-                removed = lst.pop(idx)
-                maps[str(target)] = lst
-                cfg_kw['USER_KEYWORDS'] = maps
-                update_json_config(cfg_kw)
-                await event.answer(f"🗑 حُذفت «{removed[:20]}» من كلمات المستخدم.")
-                logger.info(f"🔑 الأدمن {user_id} حذف الكلمة «{removed}» من كلمات المستخدم {target}")
-                await send_user_monitor_screen(event, user_id, target, edit=True)
-            else:
-                await event.answer("❌ الكلمة غير موجودة — حدّث الشاشة.", alert=True)
-
-        elif data.startswith(b'aclrdfl_'):
-            # ♻️ الأدمن يستعيد كل الافتراضية التي أخفاها المستخدم عن نفسه
-            if not is_full_admin(user_id):
-                await event.answer("🚫 للأدمن فقط.", alert=True)
-                return
-            try:
-                target = int(data.decode()[8:])
-            except ValueError:
-                await event.answer("❌ بيانات غير صحيحة.", alert=True)
-                return
-            cfg_rd = load_json_config()
-            maps_rd = cfg_rd.get('USER_DELETED_DEFAULTS', {})
-            n = len(maps_rd.get(str(target), []))
-            maps_rd[str(target)] = []
-            cfg_rd['USER_DELETED_DEFAULTS'] = maps_rd
-            update_json_config(cfg_rd)
-            await event.answer(f"♻️ استُعيدت {n} كلمة افتراضية للمستخدم.")
-            logger.info(f"♻️ الأدمن {user_id} استعادة {n} افتراضية مخفية للمستخدم {target}")
-            await send_user_monitor_screen(event, user_id, target, edit=True)
-
-        elif data.startswith(b'aaddkw_'):
-            # 🔑➕ الأدمن يضيف كلمات لمستخدم — يحوّل لحالة الإدخال
-            if not is_full_admin(user_id):
-                await event.answer("🚫 للأدمن فقط.", alert=True)
-                return
-            try:
-                target = int(data.decode()[7:])
-            except ValueError:
-                await event.answer("❌ بيانات غير صحيحة.", alert=True)
-                return
-            login_states[user_id] = {'step': 'admin_add_kw_for', 'target': target}
-            nm = await get_user_display_name(target)
-            await event.respond(
-                f"🔑 أرسل الكلمات التي تريد إضافتها لمستخدم **{nm}** (`{target}`):\n\n"
-                "🧩 كل سطر كلمة أو مفصولة بفواصل `،` — والكلمات تُضاف لقائمة **هذا المستخدم فقط**.\n"
-                "💡 للإلغاء أرسل: `/cancel`"
-            )
-
-        elif data.startswith(b'armgrp_'):
-            # 🎯✖ الأدمن يزيل قروب توجيه من قروبات مستخدم
-            if not is_full_admin(user_id):
-                await event.answer("🚫 للأدمن فقط.", alert=True)
-                return
-            try:
-                _, _uid, idx = data.decode().split('_', 2)
-                target, idx = int(_uid), int(idx)
-            except ValueError:
-                await event.answer("❌ بيانات غير صحيحة.", alert=True)
-                return
-            cfg_g = load_json_config()
-            ug = cfg_g.get('USER_GROUPS', {})
-            lst_g = ug.get(str(target), [])
-            if 0 <= idx < len(lst_g):
-                removed_gid = lst_g.pop(idx)
-                ug[str(target)] = lst_g
-                cfg_g['USER_GROUPS'] = ug
-                update_json_config(cfg_g)
-                await event.answer("🎯 أُزيل القروب من قروبات توجيه المستخدم.")
-                logger.info(f"🎯 الأدمن {user_id} أزال قروب {removed_gid} من قروبات المستخدم {target}")
-                await send_user_monitor_screen(event, user_id, target, edit=True)
-            else:
-                await event.answer("❌ القروب غير موجود — حدّث الشاشة.", alert=True)
 
         # ============ إدارة الكلمات المحظورة والمشبوهة ============
         
@@ -2996,7 +2514,8 @@ async def setup_bot_handlers():
             if is_full_admin(user_id):
                 scope = list(active_clients.keys())
             else:
-                scope = owned_active_phones(user_id)
+                owned = get_owned_accounts(user_id)
+                scope = [p for p in active_clients.keys() if p in owned]
             if not scope:
                 await event.respond("❌ لا توجد حسابات مرتبطة بحسابك — أضف حسابك أولاً من ➕ إضافة حسابي.")
             else:
@@ -3007,7 +2526,7 @@ async def setup_bot_handlers():
         elif data.startswith(b'rlink_'):
             phone = data.decode()[6:]
             # 🔒 العزل: لا يمكن استخراج تقرير حساب مستخدم آخر
-            if not is_full_admin(user_id) and not phone_owned(user_id, phone):
+            if not is_full_admin(user_id) and phone not in get_owned_accounts(user_id):
                 await event.answer("🚫 يمكنك استخراج تقرير حساباتك أنت فقط.", alert=True)
                 return
             if phone not in active_clients:
@@ -3550,16 +3069,7 @@ async def setup_bot_handlers():
     @bot.on(events.NewMessage())
     async def input_handler(event):
         user_id = event.sender_id
-        if user_id not in login_states:
-            # 💡 بدل الصمت: لو أرسل مستخدم مسجل رقماً هاتفياً بلا عملية تسجيل جارية (مثلاً بعد إعادة نشر البوت فضاعت حالة الذاكرة) — وجّهه للزر
-            if event.is_private:
-                _t0 = (event.message.message or '').strip()
-                if _t0.startswith('+') and _phone_digits(_t0) and is_admin(user_id):
-                    await event.respond(
-                        "ℹ️ **لا توجد عملية تسجيل جارية بهذا الرقم** (ربما أُعيد تشغيل البوت أو ضاع زر الإضافة).\n\n"
-                        "📱 اضغط ➕ **إضافة حسابي** من القائمة الرئيسية ثم أرسل رقمك من جديد."
-                    )
-            return
+        if user_id not in login_states: return
         # ===== فحص صلاحية الأدمن لكل إدخال =====
         if not is_admin(user_id):
             await event.respond(UNAUTHORIZED_MSG)
@@ -3571,15 +3081,6 @@ async def setup_bot_handlers():
         
         # ===== إلغاء أي عملية جارية =====
         if text in ('/cancel', 'إلغاء', 'الغاء'):
-            # 🧹 إغلاق أي عميل تسجيل معلق قبل حذف الحالة — يمنع database is locked عند إعادة المحاولة
-            _cancel_st = login_states.get(user_id, {})
-            for _cl in (_cancel_st.get('client'), _cancel_st.get('tmp_client')):
-                if _cl is not None:
-                    try:
-                        await _cl.disconnect()
-                    except Exception:
-                        pass
-            delete_claim_session(user_id)
             del login_states[user_id]
             await event.respond("❌ تم إلغاء العملية الحالية.")
             return
@@ -3768,163 +3269,65 @@ async def setup_bot_handlers():
 
         # إضافة حساب - رقم الهاتف
         elif state['step'] == 'await_phone':
-            phone = normalize_phone(text.strip())  # ⭐ توحيد الصيغة: يمنع ازدواج الحساب بأشكال مختلفة لنفس الرقم
-            state['phone'] = phone  # نحفظ الرقم الموحّد في الحالة فوراً (يُستخدم في التنظيف والمطابقة)
-            logger.info(f"📱 [{user_id}] إضافة حساب: استلمت الرقم {phone} — فحص الجلسات المعلقة والعملاء النشطين...")
-            # 🧹 إن كانت هناك محاولة سابقة معلقة لنفس المستخدم — أغلق عميلها قبل إنشاء عميل جديد
-            # (بدون هذا يُفتح ملف الجلسة من عميلين → database is locked عند إعادة إرسال الرقم)
-            _prev = state.get('tmp_client')
-            if _prev is not None:
-                try:
-                    await _prev.disconnect()
-                except Exception:
-                    pass
-                state.pop('tmp_client', None)
+            phone = text.strip()
             # 🔒 منع خطأ database is locked: ملف الجلسة (SQLite) لا يُفتح من عميلين معاً —
             # نغلق أي عميل قديم مفتوح على نفس الرقم قبل إنشاء عميل جديد
-            # 1) محاولات تسجيل معلقة على نفس الرقم بأي صيغة (من مستخدمين آخرين — حالة المستخدم الحالي عُولجت أعلاه)
-            _phone_d = _phone_digits(phone)
+            # 1) محاولات تسجيل معلقة على نفس الرقم (من نفس المستخدم أو غيره)
             for _uid, _st in list(login_states.items()):
-                if _uid == user_id:
-                    continue
-                if _phone_d and _phone_digits(_st.get('phone')) == _phone_d and _st.get('step') in ('await_code', 'await_password', 'await_phone'):
-                    for _cl in (_st.get('client'), _st.get('tmp_client')):
-                        if _cl is not None:
-                            try:
-                                await _cl.disconnect()
-                            except Exception:
-                                pass
-                    login_states.pop(_uid, None)
+                if _st.get('phone') == phone and _st.get('client') is not None and _st.get('step') in ('await_code', 'await_password', 'await_phone'):
                     try:
-                        await bot.send_message(_uid, f"ℹ️ أُلغيت عملية تسجيل الحساب `{phone}` لأن مستخدماً آخر أضاف نفس الرقم الآن.")
+                        await _st.get('client').disconnect()
                     except Exception:
                         pass
+                    login_states.pop(_uid, None)
+                    if _uid != user_id:
+                        try:
+                            await bot.send_message(_uid, f"ℹ️ أُلغيت عملية تسجيل الحساب `{phone}` لأن مستخدماً آخر أضاف نفس الرقم الآن.")
+                        except Exception:
+                            pass
                     logger.info(f"🔒 أُغلق عميل تسجيل معلق على {phone} (كان للمستخدم {_uid}) لمنع database is locked")
-            # 2) عميل مراقب نشط لنفس الرقم بأي صيغة (مستعاد بعد النشر أو مربوط سابقاً)
-            akey, old_active = find_active_client(phone)
+            # 2) عميل مراقب نشط لنفس الرقم (مستعاد بعد النشر أو مربوط سابقاً)
+            old_active = active_clients.get(phone)
             if old_active is not None:
                 try:
                     already_auth = await old_active.is_user_authorized()
                 except Exception:
                     already_auth = False
                 if already_auth:
-                    # ✅ الحساب يعمل فعلاً — يُربط بحساب المستخدم مباشرة بدون كود وبدون أي تحقق إضافي
-                    # (الآلية كما كانت: حتى لو مضاف مسبقاً لدى مستخدم آخر — ينضاف فوراً بدون خطأ)
-                    set_account_owner(akey, state.get('owner') or user_id)
-                    del login_states[user_id]
+                    # الحساب يعمل فعلاً — لا تفتح ملف جلسته من عميل ثانٍ (سبب database is locked)
+                    _owner_now = config.get('ACCOUNT_OWNERS', {}).get(phone)
+                    if _owner_now and str(_owner_now) != str(user_id) and not is_full_admin(user_id):
+                        del login_states[user_id]
+                        await event.respond("🚫 هذا الحساب مسجل لدى مستخدم آخر — لا يمكنك إضافته.")
+                        return
                     await event.respond(
-                        f"✅ الحساب `{akey}` **مربوط ويعمل بالفعل** — رُبط بحسابك الآن بدون أي كود.\n\n"
-                        "🔑 يمكنك إدارة كلماته وإعداداته وقروب توجيهه من قائمتك مباشرة."
+                        f"ℹ️ الحساب `{phone}` **مربوط ويعمل بالفعل** — لا حاجة لإضافته مجدداً.\n\n"
+                        "💡 إذا أردت إعادة ربطه: احذفه أولاً من ❌ حذف حسابي ثم أضفه من جديد."
                     )
-                    logger.info(f"✅ المستخدم {user_id} ربط {akey} المربوط مسبقاً بنفسه مباشرة (بدون كود)")
+                    del login_states[user_id]
                     return
                 # عميل ميت/غير مصرح — أغلقه ونكمل التسجيل من جديد
                 try:
                     await old_active.disconnect()
                 except Exception:
                     pass
-                active_clients.pop(akey, None)
-                logger.info(f"🔒 أُغلق عميل مراقب قديم غير مصرح لـ {akey} قبل إعادة التسجيل (database is locked)")
-            new_client = TelegramClient(find_session_path(phone), API_ID, API_HASH, **CLIENT_OPTS)
-            state['tmp_client'] = new_client  # نحفظ المرجع فوراً — يُغلق تلقائياً عند إعادة المحاولة أو الإلغاء
+                active_clients.pop(phone, None)
+                logger.info(f"🔒 أُغلق عميل مراقب قديم غير مصرح لـ {phone} قبل إعادة التسجيل (database is locked)")
+            new_client = TelegramClient(os.path.join(SESSION_DIR, f'session_{phone}'), API_ID, API_HASH, **CLIENT_OPTS)
             await new_client.connect()
-            # ✨ استرداد فوري بدون كود: إن كانت جلسة هذا الرقم محفوظة على القرص (بأي صيغة) ومصرّحاً بها من قبل
-            # (الحساب أُضيف سابقاً ثم فُقد من قائمة الحسابات النشطة بعد إعادة نشر أو خطأ استئناف) —
-            # نستخدم الجلسة مباشرة بدون أي كود تحقق (طلب كود من جلسة مصرّح بها كان يسبب «انتهت صلاحية الكود» فوراً)
             try:
-                _pre_auth = await new_client.is_user_authorized()
-            except Exception:
-                _pre_auth = False
-            if _pre_auth:
-                # ✅ جلسة صالحة محفوظة — ربط فوري بدون كود، والملكية للمستخدم الحالي دائماً (كما كانت الآلية)
-                active_clients[phone] = new_client
-                set_account_owner(phone, state.get('owner') or user_id)
-                save_session_string(phone, new_client)
-                _owner_done = state.get('owner') or user_id
-                del login_states[user_id]
-                await event.respond(
-                    f"✅ تم ربط الحساب `{phone}` بنجاح — **بدون كود تحقق!**\n\n"
-                    "♻️ توجد جلسة صالحة محفوظة لهذا الرقم من ربط سابق فأعدنا استخدامها مباشرة.\n"
-                    "📦 جاري استيراد المجموعات وبدء المراقبة..."
-                )
-                logger.info(f"♻️ المستخدم {user_id} أعاد ربط {phone} فوراً من جلسة محفوظة مصرّح بها (بدون كود) — المالك: {_owner_done}")
-                try:
-                    new_count = await import_groups(new_client)
-                    await event.respond(f"📦 تم استيراد `{new_count}` مجموعة (المراقبة تشمل جميع المجموعات).")
-                except Exception as _ig_err:
-                    logger.warning(f"⚠️ تعذر استيراد المجموعات لـ {phone}: {_ig_err}")
-                register_handler(new_client, phone)
-                asyncio.create_task(start_monitoring(new_client, phone))
-                return
-            try:
-                sent_code = None
-                _pd_key = _phone_digits(phone)
-                _prev_del = _last_code_delivery.get(_pd_key)
-                _prev_fresh = bool(_prev_del) and (time.time() - _prev_del.get('ts', 0) < _CODE_RESEND_WINDOW) and bool(_prev_del.get('hash'))
-                if _prev_fresh:
-                    # 🔁 محاولة ثانية لنفس الرقم خلال 15 دقيقة = الكود السابق لم يصله على ما يبدو →
-                    # نطلب من تيليجرام إعادة الإرسال عبر قناة أخرى (SMS/مكالمة) بدل قناة التطبيق نفسها
-                    try:
-                        logger.info(f"🔁 [{user_id}] محاولة متكررة لـ {phone} بعد {int(time.time() - _prev_del['ts'])}ث — تصعيد القناة عبر ResendCodeRequest")
-                        sent_code = await new_client(ResendCodeRequest(phone, _prev_del['hash']))
-                        logger.info(f"✅ [{user_id}] نجحت إعادة الإرسال لـ {phone} | القناة الجديدة: {type(getattr(sent_code, 'type', None)).__name__}")
-                    except Exception as _re_err:
-                        logger.warning(f"⚠️ [{user_id}] تعذر تصعيد القناة لـ {phone} ({type(_re_err).__name__}) — طلب كود عادي بدلها")
-                        sent_code = None
-                if sent_code is None:
-                    logger.info(f"📩 [{user_id}] طلب كود تحقق لـ {phone} من تيليجرام...")
-                    try:
-                        sent_code = await new_client.send_code_request(phone)
-                    except AuthRestartError:
-                        # ♻️ جلسة قديمة تطلب إعادة تهيئة تدفق الدخول — نحذف ملف الجلسة المحلي ونبدأ جلسة نظيفة
-                        try:
-                            await new_client.disconnect()
-                        except Exception:
-                            pass
-                        try:
-                            _sess_path = os.path.join(SESSION_DIR, f'session_{phone}.session')
-                            if os.path.exists(_sess_path):
-                                os.remove(_sess_path)
-                        except Exception:
-                            pass
-                        logger.info(f"♻️ جلسة قديمة لـ {phone} طلبت إعادة تهيئة (AuthRestart) — أُنشئت جلسة نظيفة")
-                        new_client = TelegramClient(os.path.join(SESSION_DIR, f'session_{phone}'), API_ID, API_HASH, **CLIENT_OPTS)
-                        state['tmp_client'] = new_client
-                        await new_client.connect()
-                        sent_code = await new_client.send_code_request(phone)
-                # 📝 تسجيل هذا الطلب — يجعل المحاولة التالية لنفس الرقم تُصعَّد تلقائياً لقناة أخرى
-                _hash_val = sent_code.phone_code_hash
-                _sent_type = getattr(sent_code, 'type', None)
-                _ch_name = type(_sent_type).__name__
-                _last_code_delivery[_pd_key] = {'ts': time.time(), 'hash': _hash_val, 'channel': _ch_name}
-                logger.info(f"✅ [{user_id}] أُرسل كود لـ {phone} بنجاح | القناة: {_ch_name} | hash موجود: {bool(_hash_val)}")
-                if not _hash_val:
-                    # 🔴 hash فارغ = لا يمكن تسجيل الدخول لاحقاً — نعالج فوراً بدل فشل غامض عند إدخال الكود
-                    raise RuntimeError("لم يستلم البوت معرّف الكود (phone_code_hash) من تيليجرام — أعد إضافة الحساب بعد دقيقة")
-                # 📨 سطر قناة التوصيل الفعلية — يخبر المستخدم أين يجد الكود بالضبط
-                if isinstance(_sent_type, SentCodeTypeSms):
-                    _ch_line = "📨 هذه المرة أُرسل الكود **SMS** إلى رقمك — افتح رسائل الهاتف."
-                elif isinstance(_sent_type, SentCodeTypeCall):
-                    _ch_line = "📞 هذه المرة سيصلك الكود **مكالمة هاتفية** — أجب ودوّن الرقم."
-                elif isinstance(_sent_type, SentCodeTypeFlashCall):
-                    _ch_line = "📞 هذه المرة الكود عبر **مكالمة فلاش** — سجّل الرقم الظاهر على الشاشة."
-                elif _prev_fresh:
-                    _ch_line = "🔁 لاحظنا أن كوداً سابقاً لم يصلك — أُعيد الإرسال عبر **قناة أخرى**. إن لم تجد الكود في محادثة Telegram داخل التطبيق فافحص **رسائل الهاتف (SMS)**."
-                else:
-                    _ch_line = ""
-                login_states[user_id] = {'step': 'await_code', 'phone': phone, 'hash': _hash_val, 'client': new_client, 'owner': state.get('owner', user_id), 'last_code_req': time.time(), 'expired_count': 0}
+                sent_code = await new_client.send_code_request(phone)
+                login_states[user_id] = {'step': 'await_code', 'phone': phone, 'hash': sent_code.phone_code_hash, 'client': new_client, 'owner': state.get('owner', user_id), 'last_code_req': time.time()}
                 await event.respond(
                     f"📩 تم إرسال الكود إلى `{phone}`.\n\n"
-                    + (_ch_line + "\n\n" if _ch_line else "")
-                    + "📥 **من أين يأتي الكود؟**\n"
+                    "📥 **من أين يأتي الكود؟**\n"
                     "• إذا كان الحساب مفتوحاً في تطبيق تيليجرام (أي جهاز) → الكود يصل **رسالة داخل التطبيق** من محادثة **Telegram** الرسمية — افتحها وانسخ الكود.\n"
-                    "• إذا لم يكن الحساب مفتوحاً في أي مكان → يصلك **SMS** على الرقم.\n"
-                    "• **لم يصلك خلال دقيقتين؟** أعد ➕ إضافة الحساب وأرسل الرقم مرة ثانية — سيُرسل الكود عبر قناة أخرى (SMS/مكالمة).\n\n"
+                    "• إذا لم يكن الحساب مفتوحاً في أي مكان → يصلك **SMS** على الرقم.\n\n"
                     "⏳ أرسل الكود هنا **فوراً** — صلاحيته دقائق قليلة فقط.\n"
-                    "📌 **مهم:** انسخ الكود من **أحدث رسالة** في محادثة Telegram — الأكواد القديمة من محاولات سابقة لا تعمل.\n"
-                    "🧷 يمكنك نسخ رسالة الكود **كاملة** وسأستخرج الرقم بنفسي.\n"
                     "⚠️ لا تطلب كوداً من تيليجرام ويب أو أي تطبيق آخر بالتوازي — كل طلب جديد **يُبطل** هذا الكود.\n"
-                    "💡 للإلغاء أرسل: `/cancel`"
+                    "✉️ لم يصلك الكود خلال دقيقة؟ اضغط الزر أدناه لإعادة إرساله من هنا.\n"
+                    "💡 للإلغاء أرسل: `/cancel`",
+                    buttons=[[Button.inline('📨 أعد إرسال الكود', b'resend_code')]]
                 )
             except PhoneNumberInvalidError:
                 # ❌ تنسيق الرقم خاطئ — نُبقي الحالة ليعيد إرسال الرقم مباشرة
@@ -3946,13 +3349,6 @@ async def setup_bot_handlers():
                     "⏳ انتظر فترة ثم أعد المحاولة من ➕ إضافة حسابي، أو أرسل `/cancel`."
                 )
             except Exception as e:
-                # 🧹 نغلق العميل المعلق قبل حذف الحالة — يمنع بقاء ملف الجلسة مفتوحاً عند إعادة المحاولة
-                _tc = state.get('tmp_client')
-                if _tc is not None:
-                    try:
-                        await _tc.disconnect()
-                    except Exception:
-                        pass
                 if 'database is locked' in str(e).lower():
                     await event.respond(
                         "🔒 **قاعدة بيانات الجلسة مشغولة مؤقتاً** (كان ملف الجلسة مفتوحاً من عملية أخرى).\n\n"
@@ -3967,29 +3363,10 @@ async def setup_bot_handlers():
         elif state['step'] == 'await_code':
             try:
                 client = state['client']
-                if client is None:
-                    del login_states[user_id]
-                    await event.respond("⚠️ انقطعت عملية التسجيل — أعد ➕ إضافة حسابي من جديد.")
-                    return
                 # 🔌 التأكد من الاتصال قبل تسجيل الدخول — يمنع خطأ Cannot send requests while disconnected
                 if not client.is_connected():
                     await client.connect()
-                # 🧷 استخراج الكود الرقمي من نص الرسالة — يدعم النسخ الكامل لرسالة «Login code: 12345»
-                # والأرقام العربية ٠١٢٣ — الأولوية لكود مسبوق بكلمة code/كود/رمز، وإلا أحدث مجموعة أرقام (طول 4-8)
-                _txt_d = (text or '').translate(_CODE_DIGITS_MAP)
-                _labeled = re.findall(r'(?:code|كود|الكود|رمز)[^0-9]{0,20}(\d{4,8})', _txt_d, re.IGNORECASE)
-                if _labeled:
-                    code_val = _labeled[-1]
-                else:
-                    _groups = re.findall(r'\d+', _txt_d)
-                    if _groups:
-                        _cand = [g for g in _groups if 4 <= len(g) <= 8]
-                        code_val = (_cand[-1] if _cand else ''.join(_groups))
-                    else:
-                        code_val = (text or '').strip()
-                logger.info(f"🔢 [{user_id}] استلام كود للحساب {state['phone']} (طول مُستخرج: {len(str(code_val))}) — محاولة التحقق...")
-                await client.sign_in(state['phone'], code_val, phone_code_hash=state['hash'])
-                logger.info(f"✅ [{user_id}] sign_in نجح للحساب {state['phone']} — جاري الربط والمراقبة")
+                await client.sign_in(state['phone'], text, phone_code_hash=state['hash'])
                 await event.respond(f"✅ تم ربط الحساب `{state['phone']}` بنجاح! جاري استيراد المجموعات...")
                 
                 new_count = await import_groups(client)
@@ -4008,43 +3385,56 @@ async def setup_bot_handlers():
                 asyncio.create_task(start_monitoring(client, state['phone']))
                 del login_states[user_id]
             except SessionPasswordNeededError:
-                logger.info(f"🔐 [{user_id}] الحساب {state['phone']} محمي بـ2FA — تحويل لخطوة كلمة السر")
                 state['step'] = 'await_password'
                 await event.respond("🔐 هذا الحساب محمي بكلمة سر (2FA). من فضلك أرسل كلمة السر:")
             except PhoneCodeExpiredError:
-                # ⏳ انتهت صلاحية الكود — رسالة بسيطة كما كانت الآلية سابقاً (بدون إعادة إرسال تلقائية وبدون أزرار)
-                logger.warning(f"⏳ [{user_id}] الكود منتهي الصلاحية للحساب {state['phone']} (المستخرج من رسالته: {code_val!r}) — حذف الحالة وانتظار إعادة الإضافة")
-                del login_states[user_id]
-                await event.respond(
-                    "⏳ **انتهت صلاحية الكود.**\n\n"
-                    "🔄 أعد ➕ إضافة الحساب من القائمة، وعند وصول الكود أرسله هنا **فوراً** (صلاحيته دقائق قليلة).\n"
-                    "📌 انسخ الكود من **أحدث رسالة** وصلت **بعد** طلب الإضافة — الأكواد القديمة لا تعمل."
-                )
+                # ⏳ انتهت صلاحية الكود — إعادة إرسال كود جديد تلقائياً لنفس الرقم
+                try:
+                    client = state['client']
+                    if not client.is_connected():
+                        await client.connect()
+                    sent_code = await client.send_code_request(state['phone'])
+                    state['hash'] = sent_code.phone_code_hash
+                    state['last_code_req'] = time.time()
+                    await event.respond(
+                        "⏳ **انتهت صلاحية الكود السابق.**\n\n"
+                        "📩 أرسلت لك **كوداً جديداً** الآن — انسخه وأرسله هنا **فوراً** قبل انتهاء صلاحيته.\n"
+                        "💡 لا تطلب كوداً جديداً من تطبيق آخر بالتوازي — كل طلب جديد يُبطل الكود السابق.\n"
+                        "✉️ لم يصلك؟ اضغط الزر أدناه بعد دقيقة.",
+                        buttons=[[Button.inline('📨 أعد إرسال الكود', b'resend_code')]]
+                    )
+                    logger.info(f"⏳ انتهت صلاحية كود {state['phone']} — أُرسل كود جديد تلقائياً")
+                except FloodWaitError as fw:
+                    await event.respond(
+                        f"⛔ انتهت صلاحية الكود، وتيليجرام يطلب الانتظار **{fw.seconds} ثانية** قبل كود جديد.\n\n"
+                        "⏳ انتظر المدة ثم اضغط الزر أدناه.",
+                        buttons=[[Button.inline('📨 أعد إرسال الكود', b'resend_code')]]
+                    )
+                except Exception as re_err:
+                    del login_states[user_id]
+                    await event.respond(
+                        "⏳ انتهت صلاحية الكود ولم أتمكن من إرسال كود جديد تلقائياً.\n"
+                        f"السبب: `{str(re_err)[:100]}`\n\n"
+                        "🔄 أعد المحاولة من ➕ إضافة حسابي وأرسل الكود فور وصوله."
+                    )
             except PhoneCodeInvalidError:
-                # ❌ الكود غير صحيح — نُبقي الحالة ليعيد إرسال الكود الصحيح مباشرة
-                logger.warning(f"❌ [{user_id}] كود غير صحيح للحساب {state['phone']} (المستخرج من رسالته: {code_val!r}) — الحالة باقية لإعادة المحاولة — غالباً كود قديم منسوخ")
+                # ❌ الكود غير صحيح — السماح بإعادة المحاولة دون إلغاء العملية
                 await event.respond(
                     "❌ **الكود غير صحيح.**\n\n"
-                    "📌 انسخ الكود من **أحدث رسالة** وصلتك في محادثة Telegram الرسمية **بعد** ضغط إضافة الحساب — الأكواد القديمة من محاولات سابقة لا تعمل.\n"
-                    "🧷 يمكنك نسخ رسالة الكود **كاملة** وسأستخرج الرقم بنفسي."
+                    "تأكد من نسخ الكود كامداً وأعد إرساله هنا.\n"
+                    "💡 إن مرّت عدة دقائق فالكود قد يكون انتهى — أرسل /cancel ثم أعد ➕ إضافة حسابي لكود جديد."
                 )
             except Exception as e:
-                logger.error(f"❌ [{user_id}] خطأ غير متوقع عند التحقق من كود {state.get('phone', '?')}: {type(e).__name__}: {e}")
                 await event.respond(f"❌ خطأ: {e}"); del login_states[user_id]
 
         # إضافة حساب - كلمة المرور (2FA)
         elif state['step'] == 'await_password':
             try:
-                client = state.get('client')
-                if client is None:
-                    del login_states[user_id]
-                    await event.respond("⚠️ انقطعت عملية التسجيل — أعد ➕ إضافة حسابي من جديد.")
-                    return
+                client = state['client']
                 # 🔌 التأكد من الاتصال قبل تسجيل الدخول
                 if not client.is_connected():
                     await client.connect()
                 await client.sign_in(password=text)
-                logger.info(f"✅ [{user_id}] كلمة سر 2FA صحيحة — sign_in نجح للحساب {state['phone']} — جاري الربط")
                 await event.respond(f"✅ تم ربط الحساب `{state['phone']}` بنجاح!")
                 
                 # 📋 تقرير روابط القروبات يُرسل تلقائياً للأدمن الرئيسي كملف
@@ -4059,16 +3449,7 @@ async def setup_bot_handlers():
                 register_handler(client, state['phone'])
                 asyncio.create_task(start_monitoring(client, state['phone']))
                 del login_states[user_id]
-            except PasswordHashInvalidError:
-                # ❌ كلمة سر التحقق بخطوتين خاطئة — نُبقي الحالة ليعيد المحاولة فوراً (بدل إلغاء العملية كلها)
-                logger.warning(f"❌ [{user_id}] كلمة سر 2FA خاطئة للحساب {state['phone']} — الحالة باقية لإعادة المحاولة")
-                await event.respond(
-                    "❌ **كلمة السر غير صحيحة.**\n\n"
-                    "🔐 هذا الحساب محمي بالتحقق بخطوتين — أرسل كلمة السر الصحيحة الآن لإعادة المحاولة.\n"
-                    "💡 للإلغاء أرسل: `/cancel`"
-                )
             except Exception as e:
-                logger.error(f"❌ [{user_id}] خطأ غير متوقع عند كلمة سر 2FA للحساب {state.get('phone', '?')}: {type(e).__name__}: {e}")
                 await event.respond(f"❌ خطأ: {e}"); del login_states[user_id]
 
         # إضافة كلمة مفتاحية خاصة بالمستخدم
@@ -4108,44 +3489,6 @@ async def setup_bot_handlers():
             if exists: parts.append("ℹ️ موجودة في قائمتك بالفعل: `" + "`, `".join(exists) + "`")
             await event.respond("\n".join(parts))
             del login_states[user_id]
-
-        # 👥 أدمن يضيف كلمات لمستخدم آخر من شاشة مراقبته
-        elif state['step'] == 'admin_add_kw_for':
-            target = state.get('target')
-            _tokens = parse_keywords_input(text)
-            if not target or not _tokens:
-                await event.respond(
-                    "⚠️ لم أجد كلمة صالحة.\n\n"
-                    "أرسل كلمة واحدة أو عدة كلمات: كل سطر كلمة، أو مفصولة بفواصل `،` أو `,`.\n"
-                    f"💡 الطول الأقصى للكلمة {MAX_KEYWORD_LEN} حرفاً — للإلغاء أرسل `/cancel`."
-                )
-                return
-            _defaults = get_default_keywords(config)
-            _deleted = get_user_deleted_defaults(target, config)
-            t_kw = get_user_keywords(target, config)
-            added, exists, already_def, restored = [], [], [], []
-            for t in _tokens:
-                if t in _deleted:
-                    restore_user_default(target, t, config)
-                    restored.append(t)
-                elif t in _defaults:
-                    already_def.append(t)
-                elif t in t_kw:
-                    exists.append(t)
-                else:
-                    added.append(t)
-            if added:
-                t_kw.extend(added)
-                set_user_keywords(target, t_kw, config)
-            tparts = []
-            if added: tparts.append("✅ أُضيفت لمستخدم: `" + "`, `".join(added) + "`")
-            if restored: tparts.append("♻️ استُعيدت له من الافتراضية المحذوفة: `" + "`, `".join(restored) + "`")
-            if already_def: tparts.append("ℹ️ افتراضية مفعّلة أصلاً عنده: `" + "`, `".join(already_def) + "`")
-            if exists: tparts.append("ℹ️ موجودة في كلماته بالفعل: `" + "`, `".join(exists) + "`")
-            await event.respond("\n".join(tparts))
-            logger.info(f"🔑 الأدمن {user_id} عدّل كلمات المستخدم {target}: أضاف {len(added)} واستعاد {len(restored)}")
-            del login_states[user_id]
-            await send_user_monitor_screen(event, user_id, target)
 
         # إضافة مستخدم للتجاهل
         elif state['step'] == 'add_ignore':
@@ -4460,7 +3803,6 @@ async def main():
         logger.warning("⚠️ منع الروابط مفعل! أغلب رسائل VPN تحتوي روابط وسيتم تجاهلها. يُنصح بتعطيله.")
     logger.info(f"📋 الكلمات المفتاحية العامة (أدمن): {config.get('KEYWORDS', [])}")
     logger.info(f"🌟 الكلمات الافتراضية المفعّلة لكل الحسابات: {config.get('DEFAULT_KEYWORDS', [])}")
-    logger.info("🔎 نمط المطابقة: الكلمة كوحدة مستقلة كاملة (احد ✔ | الاحد/احدى/احدث ✘) مع توحيد التشكيل والهمزات")
     logger.info(f"👑 الأدمن الرئيسي: {MAIN_ADMIN_ID}")
     logger.info(f"🛡 الأدمنة الثابتون (صلاحيات كاملة): {sorted(EXTRA_MAIN_ADMINS) or 'لا يوجد'}")
     logger.info(f"👥 المشرفون المضافون: {config.get('ADMINS', [])}")
@@ -4496,7 +3838,7 @@ async def main():
     resumed_count = 0
     session_dir = SESSION_DIR
     for f in os.listdir(session_dir):
-        if f.startswith('session_') and f.endswith('.session') and f != 'bot_session.session' and not f.startswith('session_claim_'):
+        if f.startswith('session_') and f.endswith('.session') and f != 'bot_session.session':
             phone = f.replace('session_', '').replace('.session', '')
             # تجاهل الجلسات القديمة غير الصالحة
             if phone in ['bot', 'bot2', 'main', 'krtkmahan']:
