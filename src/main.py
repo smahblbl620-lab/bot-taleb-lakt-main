@@ -3989,6 +3989,7 @@ async def setup_bot_handlers():
                         code_val = (text or '').strip()
                 logger.info(f"🔢 [{user_id}] استلام كود للحساب {state['phone']} (طول مُستخرج: {len(str(code_val))}) — محاولة التحقق...")
                 await client.sign_in(state['phone'], code_val, phone_code_hash=state['hash'])
+                logger.info(f"✅ [{user_id}] sign_in نجح للحساب {state['phone']} — جاري الربط والمراقبة")
                 await event.respond(f"✅ تم ربط الحساب `{state['phone']}` بنجاح! جاري استيراد المجموعات...")
                 
                 new_count = await import_groups(client)
@@ -4007,24 +4008,28 @@ async def setup_bot_handlers():
                 asyncio.create_task(start_monitoring(client, state['phone']))
                 del login_states[user_id]
             except SessionPasswordNeededError:
+                logger.info(f"🔐 [{user_id}] الحساب {state['phone']} محمي بـ2FA — تحويل لخطوة كلمة السر")
                 state['step'] = 'await_password'
                 await event.respond("🔐 هذا الحساب محمي بكلمة سر (2FA). من فضلك أرسل كلمة السر:")
             except PhoneCodeExpiredError:
                 # ⏳ انتهت صلاحية الكود — رسالة بسيطة كما كانت الآلية سابقاً (بدون إعادة إرسال تلقائية وبدون أزرار)
+                logger.warning(f"⏳ [{user_id}] الكود منتهي الصلاحية للحساب {state['phone']} (المستخرج من رسالته: {code_val!r}) — حذف الحالة وانتظار إعادة الإضافة")
                 del login_states[user_id]
                 await event.respond(
                     "⏳ **انتهت صلاحية الكود.**\n\n"
                     "🔄 أعد ➕ إضافة الحساب من القائمة، وعند وصول الكود أرسله هنا **فوراً** (صلاحيته دقائق قليلة).\n"
-                    "📌 انسخ الكود من **أحدث رسالة** في محادثة Telegram الرسمية — الأكواد القديمة لا تعمل."
+                    "📌 انسخ الكود من **أحدث رسالة** وصلت **بعد** طلب الإضافة — الأكواد القديمة لا تعمل."
                 )
             except PhoneCodeInvalidError:
                 # ❌ الكود غير صحيح — نُبقي الحالة ليعيد إرسال الكود الصحيح مباشرة
+                logger.warning(f"❌ [{user_id}] كود غير صحيح للحساب {state['phone']} (المستخرج من رسالته: {code_val!r}) — الحالة باقية لإعادة المحاولة — غالباً كود قديم منسوخ")
                 await event.respond(
                     "❌ **الكود غير صحيح.**\n\n"
-                    "📌 انسخ الكود من **أحدث رسالة** في محادثة Telegram الرسمية وأرسله هنا.\n"
+                    "📌 انسخ الكود من **أحدث رسالة** وصلتك في محادثة Telegram الرسمية **بعد** ضغط إضافة الحساب — الأكواد القديمة من محاولات سابقة لا تعمل.\n"
                     "🧷 يمكنك نسخ رسالة الكود **كاملة** وسأستخرج الرقم بنفسي."
                 )
             except Exception as e:
+                logger.error(f"❌ [{user_id}] خطأ غير متوقع عند التحقق من كود {state.get('phone', '?')}: {type(e).__name__}: {e}")
                 await event.respond(f"❌ خطأ: {e}"); del login_states[user_id]
 
         # إضافة حساب - كلمة المرور (2FA)
@@ -4039,6 +4044,7 @@ async def setup_bot_handlers():
                 if not client.is_connected():
                     await client.connect()
                 await client.sign_in(password=text)
+                logger.info(f"✅ [{user_id}] كلمة سر 2FA صحيحة — sign_in نجح للحساب {state['phone']} — جاري الربط")
                 await event.respond(f"✅ تم ربط الحساب `{state['phone']}` بنجاح!")
                 
                 # 📋 تقرير روابط القروبات يُرسل تلقائياً للأدمن الرئيسي كملف
@@ -4055,12 +4061,14 @@ async def setup_bot_handlers():
                 del login_states[user_id]
             except PasswordHashInvalidError:
                 # ❌ كلمة سر التحقق بخطوتين خاطئة — نُبقي الحالة ليعيد المحاولة فوراً (بدل إلغاء العملية كلها)
+                logger.warning(f"❌ [{user_id}] كلمة سر 2FA خاطئة للحساب {state['phone']} — الحالة باقية لإعادة المحاولة")
                 await event.respond(
                     "❌ **كلمة السر غير صحيحة.**\n\n"
                     "🔐 هذا الحساب محمي بالتحقق بخطوتين — أرسل كلمة السر الصحيحة الآن لإعادة المحاولة.\n"
                     "💡 للإلغاء أرسل: `/cancel`"
                 )
             except Exception as e:
+                logger.error(f"❌ [{user_id}] خطأ غير متوقع عند كلمة سر 2FA للحساب {state.get('phone', '?')}: {type(e).__name__}: {e}")
                 await event.respond(f"❌ خطأ: {e}"); del login_states[user_id]
 
         # إضافة كلمة مفتاحية خاصة بالمستخدم
