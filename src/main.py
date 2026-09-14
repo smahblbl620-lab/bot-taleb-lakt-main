@@ -1566,32 +1566,6 @@ async def setup_bot_handlers():
             else:
                 await event.answer("❌ الكلمة غير موجودة — حدّث القائمة.", alert=True)
 
-        elif data == b'resend_code':
-            # 📨 إعادة إرسال كود التحقق من نفس جلسة البوت (تحديث phone_code_hash) — بحد 60 ثانية بين الطلبات
-            st = login_states.get(user_id)
-            if not st or st.get('step') != 'await_code':
-                await event.answer("❌ لا توجد عملية تسجيل جارية — أعد ➕ إضافة حسابي.", alert=True)
-                return
-            wait_left = 60 - int(time.time() - st.get('last_code_req', 0))
-            if wait_left > 0:
-                await event.answer(f"⏳ انتظر {wait_left} ثانية — الطلبات المتتالية تُبطل الأكواد وتجلب حظر تيليجرام.", alert=True)
-                return
-            client = st.get('client')
-            try:
-                if not client.is_connected():
-                    await client.connect()
-                sent_code = await client.send_code_request(st['phone'])
-                st['hash'] = sent_code.phone_code_hash
-                st['last_code_req'] = time.time()
-                await event.answer("📩 أُرسل كود جديد — أرسله هنا فوراً.")
-                logger.info(f"📨 المستخدم {user_id} أعاد إرسال كود التحقق لـ {st['phone']} (زر الإعادة)")
-            except FloodWaitError as fw:
-                await event.answer(f"⛔ تيليجرام يطلب الانتظار {fw.seconds} ثانية قبل كود جديد.", alert=True)
-            except PhoneNumberFloodError:
-                await event.answer("⛔ أكواد كثيرة لهذا الرقم — انتظر ساعة تقريباً ثم أعد المحاولة.", alert=True)
-            except Exception as e:
-                await event.answer(f"❌ فشل: {str(e)[:80]}", alert=True)
-
         # ============ إدارة قائمة التجاهل ============
         
         elif data == b'manage_ignore':
@@ -3319,15 +3293,12 @@ async def setup_bot_handlers():
                 sent_code = await new_client.send_code_request(phone)
                 login_states[user_id] = {'step': 'await_code', 'phone': phone, 'hash': sent_code.phone_code_hash, 'client': new_client, 'owner': state.get('owner', user_id), 'last_code_req': time.time()}
                 await event.respond(
-                    f"📩 تم إرسال الكود إلى `{phone}`.\n\n"
+                    f"📩 تم إرسال الكود إلى `{phone}` عبر **تيليجرام**.\n\n"
                     "📥 **من أين يأتي الكود؟**\n"
-                    "• إذا كان الحساب مفتوحاً في تطبيق تيليجرام (أي جهاز) → الكود يصل **رسالة داخل التطبيق** من محادثة **Telegram** الرسمية — افتحها وانسخ الكود.\n"
-                    "• إذا لم يكن الحساب مفتوحاً في أي مكان → يصلك **SMS** على الرقم.\n\n"
+                    "• الكود يصل **رسالة داخل تطبيق تيليجرام** من محادثة **Telegram** الرسمية — افتحها وانسخ الكود.\n\n"
                     "⏳ أرسل الكود هنا **فوراً** — صلاحيته دقائق قليلة فقط.\n"
                     "⚠️ لا تطلب كوداً من تيليجرام ويب أو أي تطبيق آخر بالتوازي — كل طلب جديد **يُبطل** هذا الكود.\n"
-                    "✉️ لم يصلك الكود خلال دقيقة؟ اضغط الزر أدناه لإعادة إرساله من هنا.\n"
-                    "💡 للإلغاء أرسل: `/cancel`",
-                    buttons=[[Button.inline('📨 أعد إرسال الكود', b'resend_code')]]
+                    "💡 للإلغاء أرسل: `/cancel`"
                 )
             except PhoneNumberInvalidError:
                 # ❌ تنسيق الرقم خاطئ — نُبقي الحالة ليعيد إرسال الرقم مباشرة
@@ -3388,35 +3359,18 @@ async def setup_bot_handlers():
                 state['step'] = 'await_password'
                 await event.respond("🔐 هذا الحساب محمي بكلمة سر (2FA). من فضلك أرسل كلمة السر:")
             except PhoneCodeExpiredError:
-                # ⏳ انتهت صلاحية الكود — إعادة إرسال كود جديد تلقائياً لنفس الرقم
+                # ⏳ انتهت صلاحية الكود — بدون أي إعادة إرسال (الكود يصل تيليجرام فقط)
+                del login_states[user_id]
                 try:
-                    client = state['client']
-                    if not client.is_connected():
-                        await client.connect()
-                    sent_code = await client.send_code_request(state['phone'])
-                    state['hash'] = sent_code.phone_code_hash
-                    state['last_code_req'] = time.time()
-                    await event.respond(
-                        "⏳ **انتهت صلاحية الكود السابق.**\n\n"
-                        "📩 أرسلت لك **كوداً جديداً** الآن — انسخه وأرسله هنا **فوراً** قبل انتهاء صلاحيته.\n"
-                        "💡 لا تطلب كوداً جديداً من تطبيق آخر بالتوازي — كل طلب جديد يُبطل الكود السابق.\n"
-                        "✉️ لم يصلك؟ اضغط الزر أدناه بعد دقيقة.",
-                        buttons=[[Button.inline('📨 أعد إرسال الكود', b'resend_code')]]
-                    )
-                    logger.info(f"⏳ انتهت صلاحية كود {state['phone']} — أُرسل كود جديد تلقائياً")
-                except FloodWaitError as fw:
-                    await event.respond(
-                        f"⛔ انتهت صلاحية الكود، وتيليجرام يطلب الانتظار **{fw.seconds} ثانية** قبل كود جديد.\n\n"
-                        "⏳ انتظر المدة ثم اضغط الزر أدناه.",
-                        buttons=[[Button.inline('📨 أعد إرسال الكود', b'resend_code')]]
-                    )
-                except Exception as re_err:
-                    del login_states[user_id]
-                    await event.respond(
-                        "⏳ انتهت صلاحية الكود ولم أتمكن من إرسال كود جديد تلقائياً.\n"
-                        f"السبب: `{str(re_err)[:100]}`\n\n"
-                        "🔄 أعد المحاولة من ➕ إضافة حسابي وأرسل الكود فور وصوله."
-                    )
+                    await state['client'].disconnect()
+                except Exception:
+                    pass
+                await event.respond(
+                    "⏳ **انتهت صلاحية الكود.**\n\n"
+                    "🔄 أعد الإضافة من ➕ إضافة حسابي وسيصلك كود جديد في **تيليجرام** مباشرة.\n"
+                    "💡 انسخ الكود من محادثة **Telegram** الرسمية وأرسله هنا **فوراً** — الصلاحية دقائق قليلة."
+                )
+                logger.info(f"⏳ انتهت صلاحية كود {state['phone']} — أُلغيت العملية بدون إعادة إرسال")
             except PhoneCodeInvalidError:
                 # ❌ الكود غير صحيح — السماح بإعادة المحاولة دون إلغاء العملية
                 await event.respond(
