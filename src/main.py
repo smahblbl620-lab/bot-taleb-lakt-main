@@ -224,6 +224,97 @@ def get_user_fwd_groups(user_id, cfg=None):
     title_map = {g.get('id'): g.get('title', g.get('id')) for g in cfg.get('FORWARD_GROUPS', [])}
     return [{'id': gid, 'title': title_map.get(gid, str(gid))} for gid in gids]
 
+def get_all_known_users(cfg=None):
+    """👥 كل المستخدمين المعروفين للبوت (لهم حسابات/كلمات/قروبات/قوالب أو أدمن) — لشاشة مراقبة الأدمن"""
+    if cfg is None:
+        cfg = load_json_config()
+    uids = set()
+    for m in ('ACCOUNT_OWNERS', 'USER_KEYWORDS', 'USER_DELETED_DEFAULTS', 'USER_GROUPS', 'USER_DM_TEMPLATES', 'USER_GRP_TEMPLATES'):
+        v = cfg.get(m, {})
+        if isinstance(v, dict):
+            for k in v.keys():
+                try:
+                    uids.add(int(k))
+                except (ValueError, TypeError):
+                    pass
+    for a in cfg.get('ADMINS', []):
+        try:
+            uids.add(int(a))
+        except (ValueError, TypeError):
+            pass
+    uids.update(int(x) for x in EXTRA_MAIN_ADMINS)
+    uids.add(int(MAIN_ADMIN_ID))
+    return sorted(uids)
+
+_user_name_cache = {}
+async def get_user_display_name(uid):
+    """اسم المستخدم للعرض في شاشات مراقبة الأدمن — مع تخزين مؤقت لتفادي الاستعلامات المتكررة"""
+    uid = int(uid)
+    if uid in _user_name_cache:
+        return _user_name_cache[uid]
+    name = None
+    try:
+        ent = await bot.get_entity(uid)
+        base = getattr(ent, 'first_name', None) or getattr(ent, 'title', None)
+        uname = getattr(ent, 'username', None)
+        if base and uname:
+            name = f"{base} (@{uname})"
+        elif uname:
+            name = f"@{uname}"
+        elif base:
+            name = base
+    except Exception:
+        name = None
+    result = (name or f"مستخدم {uid}")[:40]
+    _user_name_cache[uid] = result
+    return result
+
+def get_user_kind_label(uid, cfg=None):
+    """تصنيف المستخدم (رتبته) للعرض في ملفه ضمن شاشة المراقبة"""
+    if cfg is None:
+        cfg = load_json_config()
+    if uid == MAIN_ADMIN_ID or int(uid) == int(MAIN_ADMIN_ID):
+        return "👑 الأدمن الرئيسي (المالك)"
+    if int(uid) in [int(x) for x in EXTRA_MAIN_ADMINS]:
+        return "🛡 أدمن ثابت (صلاحيات كاملة)"
+    if get_user_role(uid) == 'admin':
+        return "🛡 أدمن (رتبة أدمن)"
+    if uid in cfg.get('ADMINS', []) or int(uid) in [int(a) for a in cfg.get('ADMINS', []) if str(a).isdigit()]:
+        return "👥 مشرف مضاف"
+    return "👤 عضو"
+
+async def _delete_account_full(phone):
+    """🗑 حذف حساب مراقب بالكامل: فصل العميل + حذف ملف الجلسة + تنظيف الملكية واعتمادات القروبات — تُستخدم من حذف المستخدم ومن مراقبة الأدمن"""
+    if phone in active_clients:
+        try:
+            await active_clients[phone].disconnect()
+        except Exception:
+            pass
+        active_clients.pop(phone, None)
+    sess_path = os.path.join(SESSION_DIR, f'session_{phone}.session')
+    if os.path.exists(sess_path):
+        try:
+            os.remove(sess_path)
+        except Exception:
+            pass
+    try:
+        forget_session_string(phone)
+    except Exception:
+        pass
+    try:
+        cfg_del = load_json_config()
+        ag_map = cfg_del.get('ACCOUNT_GROUPS', {})
+        if phone in ag_map:
+            ag_map.pop(phone, None)
+            cfg_del['ACCOUNT_GROUPS'] = ag_map
+        ow_map = cfg_del.get('ACCOUNT_OWNERS', {})
+        if phone in ow_map:
+            ow_map.pop(phone, None)
+            cfg_del['ACCOUNT_OWNERS'] = ow_map
+        update_json_config(cfg_del)
+    except Exception:
+        pass
+
 def get_user_keywords(user_id, cfg=None):
     """🔑 الكلمات المفتاحية الخاصة بمستخدم محدد — خصوصية تامة بين المستخدمين"""
     if cfg is None:
@@ -420,6 +511,122 @@ def set_own_templates(user_id, kind, items, cfg=None):
     maps[str(user_id)] = items
     cfg[key] = maps
     update_json_config(cfg)
+
+# ============ 👥 شاشات مراقبة المستخدمين للأدمن ============
+
+UMON_PAGE_SIZE = 12  # عدد المستخدمين في الصفحة الواحدة
+
+async def send_users_monitor_screen(event, admin_id, page=0, edit=False):
+    """👥 شاشة مراقبة المستخدمين للأدمن — كل مستخدم بزر يفتح ملفه الكامل (حساباته، كلماته، إعداداته)"""
+    config = load_json_config()
+    uids = get_all_known_users(config)
+    ow = config.get('ACCOUNT_OWNERS', {})
+    pages = max(1, (len(uids) + UMON_PAGE_SIZE - 1) // UMON_PAGE_SIZE)
+    page = max(0, min(page, pages - 1))
+    chunk = uids[page * UMON_PAGE_SIZE:(page + 1) * UMON_PAGE_SIZE]
+    names = await asyncio.gather(*[get_user_display_name(u) for u in chunk], return_exceptions=True)
+    kw_map = config.get('USER_KEYWORDS', {})
+    msg = (f"👥 **مراقبة المستخدمين** — الإجمالي: **{len(uids)}**\n\n"
+           f"📱 الحسابات المرتبطة: **{len(ow)}** | 🟢 متصلة الآن: **{len(active_clients)}**\n\n"
+           "👇 اضغط أي مستخدم لفتح ملفه الكامل: حساباته، كلماته، قروبه، قوالبه، وكل إعداداته.")
+    rows = []
+    for u, nm in zip(chunk, names):
+        nm = nm if isinstance(nm, str) else f"مستخدم {u}"
+        accs = [p for p, o in ow.items() if str(o) == str(u)]
+        kws = len(kw_map.get(str(u), []))
+        rows.append([Button.inline(f"👤 {nm[:24]} — {len(accs)}📱 {kws}🔑", f"umon_{u}".encode())])
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(Button.inline('◀️ السابق', f"umonp_{page-1}".encode()))
+        nav.append(Button.inline(f"📄 {page+1}/{pages}", b'noop_page'))
+        if page < pages - 1:
+            nav.append(Button.inline('التالي ▶️', f"umonp_{page+1}".encode()))
+        rows.append(nav)
+    rows.append([Button.inline('🔙 رجوع للقائمة', b'back_main')])
+    try:
+        if edit:
+            await event.edit(msg, buttons=rows)
+        else:
+            await event.respond(msg, buttons=rows)
+    except Exception:
+        await event.respond(msg, buttons=rows)
+
+async def send_user_monitor_screen(event, admin_id, target_uid, edit=False):
+    """👤 ملف المستخدم الكامل للأدمن: رتبته، حساباته، كلماته، قروبه، قوالبه + أزرار التغيير عليها"""
+    config = load_json_config()
+    uid = int(target_uid)
+    uname = await get_user_display_name(uid)
+    kind = get_user_kind_label(uid, config)
+    max_acc = int(config.get('MAX_ACCOUNTS_PER_USER', 3) or 3)
+    ow = config.get('ACCOUNT_OWNERS', {})
+    his_phones = [p for p, o in ow.items() if str(o) == str(uid)]
+    his_kws = config.get('USER_KEYWORDS', {}).get(str(uid), [])
+    his_deleted = config.get('USER_DELETED_DEFAULTS', {}).get(str(uid), [])
+    his_groups = get_user_fwd_groups(uid, config)
+    dm_tpl = config.get('USER_DM_TEMPLATES', {}).get(str(uid), [])
+    grp_tpl = config.get('USER_GRP_TEMPLATES', {}).get(str(uid), [])
+
+    msg = (f"👤 **ملف المستخدم**\n\n"
+           f"🧑 {uname}\n"
+           f"🆔 المعرف: `{uid}`\n"
+           f"{kind}\n"
+           f"📊 حصة الحسابات: **{len(his_phones)}/{max_acc}**\n\n")
+    # الحسابات
+    msg += f"📱 **حساباته المرتبطة** ({len(his_phones)}):\n"
+    acc_rows = []
+    if his_phones:
+        for p in his_phones:
+            online = '🟢 متصل' if p in active_clients else '⚪ غير متصل'
+            approved = len(config.get('ACCOUNT_GROUPS', {}).get(str(p), []))
+            msg += f"• `{p}` — {online} — قروبات معتمدة للحساب: {approved}\n"
+            acc_rows.append([Button.inline(f"🗑 حذف حسابه {p}", f"adeltel_{uid}_{p}".encode())])
+    else:
+        msg += "• لا يوجد — لم يضف حساباً بعد.\n"
+    # قروبات التوجيه
+    msg += f"\n🎯 **قروبات توجيهه** ({len(his_groups)}):\n"
+    grp_btns = []
+    if his_groups:
+        for i, g in enumerate(his_groups[:10]):
+            title = str(g.get('title', g.get('id')))[:30]
+            msg += f"{i+1}. {title}\n"
+            grp_btns.append(Button.inline(f"✖ {title[:16]}", f"armgrp_{uid}_{i}".encode()))
+    else:
+        msg += "• لا يوجد — لم يعتمد قروباً بعد.\n"
+    # الكلمات
+    msg += f"\n🔑 **كلماته الخاصة** ({len(his_kws)}):\n"
+    kw_btns = []
+    if his_kws:
+        msg += "`" + "`, `".join(his_kws[:20]) + "`\n"
+        kw_btns = [Button.inline(f"✖ {k[:14]}", f"adelkw_{uid}_{i}".encode()) for i, k in enumerate(his_kws[:10])]
+    else:
+        msg += "• لا توجد — أضفها له من الزر أدناه.\n"
+    # الافتراضيات المخفية
+    msg += f"\n🌟 **الافتراضية التي أخفاها عن نفسه** ({len(his_deleted)}):\n"
+    msg += ("`" + "`, `".join(his_deleted[:15]) + "`") if his_deleted else "• لا شيء — كل الافتراضية مفعّلة عنده.\n"
+    # القوالب
+    msg += f"\n💬 **قوالبه على الخاص** ({len(dm_tpl)}):\n"
+    msg += ("\n".join([f"• \"{t[:70]}{'…' if len(t) > 70 else ''}\"" for t in dm_tpl[:2]]) if dm_tpl else "• لا توجد.\n")
+    msg += f"\n👥 **قوالبه في القروب** ({len(grp_tpl)}):\n"
+    msg += ("\n".join([f"• \"{t[:70]}{'…' if len(t) > 70 else ''}\"" for t in grp_tpl[:2]]) if grp_tpl else "• لا توجد.\n")
+
+    buttons = []
+    for i in range(0, len(kw_btns), 2):
+        buttons.append(kw_btns[i:i+2])
+    buttons.append([Button.inline('🔑 أضف كلمة له', f"aaddkw_{uid}".encode())])
+    if his_deleted:
+        buttons.append([Button.inline(f"♻️ استعادة كل افتراضياته ({len(his_deleted)})", f"aclrdfl_{uid}".encode())])
+    for i in range(0, len(grp_btns), 2):
+        buttons.append(grp_btns[i:i+2])
+    buttons += acc_rows
+    buttons.append([Button.inline('👥 كل المستخدمين', b'users_monitor'), Button.inline('🏠 الرئيسية', b'back_main')])
+    try:
+        if edit:
+            await event.edit(msg, buttons=buttons)
+        else:
+            await event.respond(msg, buttons=buttons)
+    except Exception:
+        await event.respond(msg, buttons=buttons)
 
 async def ensure_connected(client):
     """🔌 إعادة الاتصال تلقائياً إذا انقطع العميل — يمنع خطأ Cannot send requests while disconnected"""
@@ -1295,6 +1502,8 @@ async def setup_bot_handlers():
         buttons.append([Button.inline('🎯 قروب توجيه رسائلي', b'myfwd')])
         if has_perm(user_id, 'view_stats') or owned_accounts:
             buttons.append([Button.inline('📋 الحسابات المرتبطة', b'list_acc')])
+        if is_full_admin(user_id):
+            buttons.append([Button.inline('👥 مراقبة المستخدمين (أدمن)', b'users_monitor')])
         # 🔑💬 خصوصية لكل مستخدم: كلماته المفتاحية وردوده الخاصة به هو فقط — يضيفها بنفسه
         buttons.append([Button.inline('🔑 كلماتي المفتاحية', b'manage_kw'), Button.inline('💬 ردودي على الخاص', b'manage_dm_templates')])
         buttons.append([Button.inline('👥 ردودي في القروب', b'manage_grp_templates')])
@@ -1481,14 +1690,26 @@ async def setup_bot_handlers():
             if not active_clients:
                 await event.respond("❌ لا توجد حسابات مرتبطة حالياً.")
             elif is_full_admin(user_id):
-                # 🔒 العزل: الأدمن الكامل فقط يرى كل الحسابات — العضو يرى حساباته هو فقط
+                # 👥 للأدمن: عرض مجمّع حسب المالك + زر لكل مستخدم يفتح ملفه الكامل (حساباته وكلماته وإعداداته)
                 ow = config.get('ACCOUNT_OWNERS', {})
-                lines = []
+                by_owner = {}
+                no_owner = []
                 for p in active_clients.keys():
-                    owner = ow.get(str(p))
-                    tag = f" (مالك: {owner})" if owner else ""
-                    lines.append(f"- `{p}`{tag}")
-                await event.respond("✅ **الحسابات المرتبطة:**\n" + "\n".join(lines))
+                    o = ow.get(str(p), ow.get(p))
+                    if o is None:
+                        no_owner.append(p)
+                    else:
+                        by_owner.setdefault(int(o), []).append(p)
+                lines = ["✅ **الحسابات المرتبطة** (مجمّعة حسب المالك):\n"]
+                btn_rows = []
+                for o in sorted(by_owner):
+                    nm = await get_user_display_name(o)
+                    lines.append(f"👤 **{nm}** (`{o}`): " + "، ".join(f"`{p}`" for p in by_owner[o]))
+                    btn_rows.append([Button.inline(f"👤 ملف {nm[:20]} ({len(by_owner[o])}📱)", f"umon_{o}".encode())])
+                if no_owner:
+                    lines.append("⚙️ بدون مالك: " + "، ".join(f"`{p}`" for p in no_owner))
+                btn_rows.append([Button.inline('👥 مراقبة كل المستخدمين', b'users_monitor')])
+                await event.respond("\n".join(lines), buttons=btn_rows)
             else:
                 owned = get_owned_accounts(user_id)
                 mine = [p for p in active_clients.keys() if p in owned]
@@ -1715,6 +1936,149 @@ async def setup_bot_handlers():
                 await event.respond(f"✅ تم حذف الحساب `{phone}` بنجاح.")
             else:
                 await event.respond("❌ الحساب غير موجود.")
+
+        # ============ 👥 مراقبة المستخدمين وإدارة ملفاتهم (أدمن فقط) ============
+
+        elif data == b'users_monitor':
+            if not is_full_admin(user_id):
+                await event.answer("🚫 هذه الشاشة للأدمن فقط.", alert=True)
+                return
+            logger.info(f"👥 الأدمن {user_id} فتح شاشة مراقبة المستخدمين")
+            await send_users_monitor_screen(event, user_id, page=0)
+
+        elif data == b'noop_page':
+            await event.answer()
+
+        elif data.startswith(b'umonp_'):
+            # 📄 تنقل صفحات قائمة المستخدمين
+            if not is_full_admin(user_id):
+                await event.answer("🚫 هذه الشاشة للأدمن فقط.", alert=True)
+                return
+            try:
+                pg = int(data.decode()[6:])
+            except ValueError:
+                await event.answer("❌ بيانات غير صحيحة.", alert=True)
+                return
+            await event.answer()
+            await send_users_monitor_screen(event, user_id, page=pg, edit=True)
+
+        elif data.startswith(b'umon_'):
+            # 👤 ملف مستخدم كامل — للأدمن فقط
+            if not is_full_admin(user_id):
+                await event.answer("🚫 هذه الشاشة للأدمن فقط.", alert=True)
+                return
+            try:
+                target = int(data.decode()[5:])
+            except ValueError:
+                await event.answer("❌ بيانات غير صحيحة.", alert=True)
+                return
+            await event.answer()
+            logger.info(f"👤 الأدمن {user_id} فتح ملف المستخدم {target} من مراقبة المستخدمين")
+            await send_user_monitor_screen(event, user_id, target)
+
+        elif data.startswith(b'adeltel_'):
+            # 🗑 الأدمن يحذف حساب أحد المستخدمين من ملفه
+            if not is_full_admin(user_id):
+                await event.answer("🚫 للأدمن فقط.", alert=True)
+                return
+            try:
+                _, _uid, phone = data.decode().split('_', 2)
+                target = int(_uid)
+            except ValueError:
+                await event.answer("❌ بيانات غير صحيحة.", alert=True)
+                return
+            await _delete_account_full(phone)
+            await event.answer(f"🗑 حُذف حساب {phone} وتنظيف كل بياناته.", alert=True)
+            logger.info(f"🗑 الأدمن {user_id} حذف حساب {phone} (كان للمستخدم {target}) من شاشة المراقبة")
+            await send_user_monitor_screen(event, user_id, target, edit=True)
+
+        elif data.startswith(b'adelkw_'):
+            # 🔑✖ الأدمن يحذف كلمة خاصة من كلمات مستخدم
+            if not is_full_admin(user_id):
+                await event.answer("🚫 للأدمن فقط.", alert=True)
+                return
+            try:
+                _, _uid, idx = data.decode().split('_', 2)
+                target, idx = int(_uid), int(idx)
+            except ValueError:
+                await event.answer("❌ بيانات غير صحيحة.", alert=True)
+                return
+            cfg_kw = load_json_config()
+            maps = cfg_kw.get('USER_KEYWORDS', {})
+            lst = maps.get(str(target), [])
+            if 0 <= idx < len(lst):
+                removed = lst.pop(idx)
+                maps[str(target)] = lst
+                cfg_kw['USER_KEYWORDS'] = maps
+                update_json_config(cfg_kw)
+                await event.answer(f"🗑 حُذفت «{removed[:20]}» من كلمات المستخدم.")
+                logger.info(f"🔑 الأدمن {user_id} حذف الكلمة «{removed}» من كلمات المستخدم {target}")
+                await send_user_monitor_screen(event, user_id, target, edit=True)
+            else:
+                await event.answer("❌ الكلمة غير موجودة — حدّث الشاشة.", alert=True)
+
+        elif data.startswith(b'aclrdfl_'):
+            # ♻️ الأدمن يستعيد كل الافتراضية التي أخفاها المستخدم عن نفسه
+            if not is_full_admin(user_id):
+                await event.answer("🚫 للأدمن فقط.", alert=True)
+                return
+            try:
+                target = int(data.decode()[8:])
+            except ValueError:
+                await event.answer("❌ بيانات غير صحيحة.", alert=True)
+                return
+            cfg_rd = load_json_config()
+            maps_rd = cfg_rd.get('USER_DELETED_DEFAULTS', {})
+            n = len(maps_rd.get(str(target), []))
+            maps_rd[str(target)] = []
+            cfg_rd['USER_DELETED_DEFAULTS'] = maps_rd
+            update_json_config(cfg_rd)
+            await event.answer(f"♻️ استُعيدت {n} كلمة افتراضية للمستخدم.")
+            logger.info(f"♻️ الأدمن {user_id} استعادة {n} افتراضية مخفية للمستخدم {target}")
+            await send_user_monitor_screen(event, user_id, target, edit=True)
+
+        elif data.startswith(b'aaddkw_'):
+            # 🔑➕ الأدمن يضيف كلمات لمستخدم — يحوّل لحالة الإدخال
+            if not is_full_admin(user_id):
+                await event.answer("🚫 للأدمن فقط.", alert=True)
+                return
+            try:
+                target = int(data.decode()[7:])
+            except ValueError:
+                await event.answer("❌ بيانات غير صحيحة.", alert=True)
+                return
+            login_states[user_id] = {'step': 'admin_add_kw_for', 'target': target}
+            nm = await get_user_display_name(target)
+            await event.respond(
+                f"🔑 أرسل الكلمات التي تريد إضافتها لمستخدم **{nm}** (`{target}`):\n\n"
+                "🧩 كل سطر كلمة أو مفصولة بفواصل `،` — والكلمات تُضاف لقائمة **هذا المستخدم فقط**.\n"
+                "💡 للإلغاء أرسل: `/cancel`"
+            )
+
+        elif data.startswith(b'armgrp_'):
+            # 🎯✖ الأدمن يزيل قروب توجيه من قروبات مستخدم
+            if not is_full_admin(user_id):
+                await event.answer("🚫 للأدمن فقط.", alert=True)
+                return
+            try:
+                _, _uid, idx = data.decode().split('_', 2)
+                target, idx = int(_uid), int(idx)
+            except ValueError:
+                await event.answer("❌ بيانات غير صحيحة.", alert=True)
+                return
+            cfg_g = load_json_config()
+            ug = cfg_g.get('USER_GROUPS', {})
+            lst_g = ug.get(str(target), [])
+            if 0 <= idx < len(lst_g):
+                removed_gid = lst_g.pop(idx)
+                ug[str(target)] = lst_g
+                cfg_g['USER_GROUPS'] = ug
+                update_json_config(cfg_g)
+                await event.answer("🎯 أُزيل القروب من قروبات توجيه المستخدم.")
+                logger.info(f"🎯 الأدمن {user_id} أزال قروب {removed_gid} من قروبات المستخدم {target}")
+                await send_user_monitor_screen(event, user_id, target, edit=True)
+            else:
+                await event.answer("❌ القروب غير موجود — حدّث الشاشة.", alert=True)
 
         # ============ إدارة الكلمات المحظورة والمشبوهة ============
         
@@ -3519,6 +3883,44 @@ async def setup_bot_handlers():
             if exists: parts.append("ℹ️ موجودة في قائمتك بالفعل: `" + "`, `".join(exists) + "`")
             await event.respond("\n".join(parts))
             del login_states[user_id]
+
+        # 👥 أدمن يضيف كلمات لمستخدم آخر من شاشة مراقبته
+        elif state['step'] == 'admin_add_kw_for':
+            target = state.get('target')
+            _tokens = parse_keywords_input(text)
+            if not target or not _tokens:
+                await event.respond(
+                    "⚠️ لم أجد كلمة صالحة.\n\n"
+                    "أرسل كلمة واحدة أو عدة كلمات: كل سطر كلمة، أو مفصولة بفواصل `،` أو `,`.\n"
+                    f"💡 الطول الأقصى للكلمة {MAX_KEYWORD_LEN} حرفاً — للإلغاء أرسل `/cancel`."
+                )
+                return
+            _defaults = get_default_keywords(config)
+            _deleted = get_user_deleted_defaults(target, config)
+            t_kw = get_user_keywords(target, config)
+            added, exists, already_def, restored = [], [], [], []
+            for t in _tokens:
+                if t in _deleted:
+                    restore_user_default(target, t, config)
+                    restored.append(t)
+                elif t in _defaults:
+                    already_def.append(t)
+                elif t in t_kw:
+                    exists.append(t)
+                else:
+                    added.append(t)
+            if added:
+                t_kw.extend(added)
+                set_user_keywords(target, t_kw, config)
+            tparts = []
+            if added: tparts.append("✅ أُضيفت لمستخدم: `" + "`, `".join(added) + "`")
+            if restored: tparts.append("♻️ استُعيدت له من الافتراضية المحذوفة: `" + "`, `".join(restored) + "`")
+            if already_def: tparts.append("ℹ️ افتراضية مفعّلة أصلاً عنده: `" + "`, `".join(already_def) + "`")
+            if exists: tparts.append("ℹ️ موجودة في كلماته بالفعل: `" + "`, `".join(exists) + "`")
+            await event.respond("\n".join(tparts))
+            logger.info(f"🔑 الأدمن {user_id} عدّل كلمات المستخدم {target}: أضاف {len(added)} واستعاد {len(restored)}")
+            del login_states[user_id]
+            await send_user_monitor_screen(event, user_id, target)
 
         # إضافة مستخدم للتجاهل
         elif state['step'] == 'add_ignore':
