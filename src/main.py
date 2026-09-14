@@ -7,7 +7,9 @@ import time
 import shutil
 from functools import lru_cache
 from telethon import TelegramClient, events, Button
-from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, PhoneCodeExpiredError, FloodWaitError, PhoneNumberFloodError, PhoneNumberInvalidError, AuthRestartError, PasswordHashInvalidError
+from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, PhoneCodeExpiredError, FloodWaitError, PhoneNumberFloodError, PhoneNumberInvalidError, AuthRestartError, PasswordHashInvalidError, SendCodeUnavailableError
+from telethon.tl.functions.auth import ResendCodeRequest
+from telethon.tl.types.auth import SentCodeTypeApp, SentCodeTypeSms, SentCodeTypeCall, SentCodeTypeFlashCall
 from telethon.sessions import StringSession
 from telethon.tl.types import Chat, Channel, ChatInviteAlready
 from telethon.tl.functions.messages import ExportChatInviteRequest, CheckChatInviteRequest
@@ -1584,6 +1586,207 @@ async def start_monitoring(client, phone):
             logger.error(f"❌ خطأ غير متوقع في مراقبة الحساب {phone}: {e}")
             await asyncio.sleep(10)
 
+# ============ منطق إضافة الحساب (مستخرج لدالة مشتركة — يُعاد تشغيله من await_code عند إرسال الرقم بدل الكود) ============
+
+def _code_channel_line(sent_code):
+    """وصف قناة وصول الكود الفعلية من كائن SentCode — (تطبيق تيليجرام / SMS / مكالمة)"""
+    try:
+        _t = getattr(sent_code, 'type', None)
+        _name = type(_t).__name__
+        _ln = getattr(_t, 'length', None)
+        _ln_txt = f" ({_ln} خانات)" if _ln else ""
+        if isinstance(_t, SentCodeTypeSms):
+            return f"📨 الكود أُرسل عبر **SMS** على الرقم{_ln_txt} — افتح رسائل الهاتف."
+        if isinstance(_t, SentCodeTypeCall):
+            return f"📞 الكود سيصلك **مكالمة هاتفية** تقرأ الرقم{_ln_txt}."
+        if isinstance(_t, SentCodeTypeFlashCall):
+            return "📞 الكود سيصلك **مكالمة فلاش** — سجّل الرقم الظاهر على الشاشة."
+        if isinstance(_t, SentCodeTypeApp):
+            return f"💬 الكود أُرسل **داخل تطبيق تيليجرام**{_ln_txt} — من محادثة **Telegram** الرسمية (ليس من البوت!)."
+        return "💬 الكود أُرسل داخل تطبيق تيليجرام (محادثة **Telegram** الرسمية) أو عبر SMS."
+    except Exception:
+        return "💬 الكود أُرسل داخل تطبيق تيليجرام (محادثة **Telegram** الرسمية) أو عبر SMS."
+
+async def run_phone_login_flow(event, user_id, text):
+    """🆕 إضافة حساب: استقبال رقم الهاتف → إرسال كود التحقق (مع logging شامل وزر إعادة الإرسال).
+    مُستخرجة لدالة مستقلة حتى يعاد تشغيلها تلقائياً عندما يرسل المستخدم رقمه بدل الكود."""
+    state = login_states[user_id]
+    phone = normalize_phone(text.strip())
+    state['phone'] = phone
+    logger.info(f"📱 [{user_id}] إضافة حساب: أُرسل الرقم {phone} — فحص المحاولات المعلقة السابقة...")
+    try:
+        # 🧹 إن كانت هناك محاولة سابقة معلقة لنفس المستخدم — أغلق عميلها قبل إنشاء عميل جديد
+        # (بدون هذا يُفتح ملف الجلسة من عميلين → database is locked عند إعادة إرسال الرقم)
+        _prev = state.get('tmp_client')
+        if _prev is not None:
+            try:
+                await _prev.disconnect()
+            except Exception:
+                pass
+            state.pop('tmp_client', None)
+        # 🔒 منع خطأ database is locked: ملف الجلسة (SQLite) لا يُفتح من عميلين معاً —
+        # نغلق أي عميل قديم مفتوح على نفس الرقم قبل إنشاء عميل جديد
+        # 1) محاولات تسجيل معلقة على نفس الرقم بأي صيغة (من مستخدمين آخرين — حالة المستخدم الحالي عُولجت أعلاه)
+        _phone_d = _phone_digits(phone)
+        for _uid, _st in list(login_states.items()):
+            if _uid == user_id:
+                continue
+            if _phone_d and _phone_digits(_st.get('phone')) == _phone_d and _st.get('step') in ('await_code', 'await_password', 'await_phone'):
+                for _cl in (_st.get('client'), _st.get('tmp_client')):
+                    if _cl is not None:
+                        try:
+                            await _cl.disconnect()
+                        except Exception:
+                            pass
+                login_states.pop(_uid, None)
+                try:
+                    await bot.send_message(_uid, f"ℹ️ أُلغيت عملية تسجيل الحساب `{phone}` لأن مستخدماً آخر أضاف نفس الرقم الآن.")
+                except Exception:
+                    pass
+                logger.info(f"🔒 أُغلق عميل تسجيل معلق على {phone} (كان للمستخدم {_uid}) لمنع database is locked")
+        # 2) عميل مراقب نشط لنفس الرقم بأي صيغة (مستعاد بعد النشر أو مربوط سابقاً)
+        akey, old_active = find_active_client(phone)
+        if old_active is not None:
+            try:
+                already_auth = await old_active.is_user_authorized()
+            except Exception:
+                already_auth = False
+            if already_auth:
+                # ✅ الحساب يعمل فعلاً — يُربط بحساب المستخدم مباشرة بدون كود وبدون أي تحقق إضافي
+                set_account_owner(akey, state.get('owner') or user_id)
+                del login_states[user_id]
+                await event.respond(
+                    f"✅ الحساب `{akey}` **مربوط ويعمل بالفعل** — رُبط بحسابك الآن بدون أي كود.\n\n"
+                    "🔑 يمكنك إدارة كلماته وإعداداته وقروب توجيهه من قائمتك مباشرة."
+                )
+                logger.info(f"✅ [{user_id}] ربط {akey} المربوط مسبقاً بنفسه مباشرة (بدون كود)")
+                return
+            # عميل ميت/غير مصرح — أغلقه ونكمل التسجيل من جديد
+            try:
+                await old_active.disconnect()
+            except Exception:
+                pass
+            active_clients.pop(akey, None)
+            logger.info(f"🔒 أُغلق عميل مراقب قديم غير مصرح لـ {akey} قبل إعادة التسجيل (database is locked)")
+        new_client = TelegramClient(find_session_path(phone), API_ID, API_HASH, **CLIENT_OPTS)
+        state['tmp_client'] = new_client  # نحفظ المرجع فوراً — يُغلق تلقائياً عند إعادة المحاولة أو الإلغاء
+        logger.info(f"🔌 [{user_id}] الاتصال بجلسة {phone}...")
+        await new_client.connect()
+        logger.info(f"🔌 [{user_id}] تم الاتصال بجلسة {phone} — فحص إن كانت مصرّحاً بها مسبقاً...")
+        # ✨ استرداد فوري بدون كود: إن كانت جلسة هذا الرقم محفوظة على القرص (بأي صيغة) ومصرّحاً بها من قبل
+        try:
+            _pre_auth = await new_client.is_user_authorized()
+        except Exception:
+            _pre_auth = False
+        logger.info(f"🔍 [{user_id}] جلسة {phone}: مصرّح بها؟ {_pre_auth}")
+        if _pre_auth:
+            # ✅ جلسة صالحة محفوظة — ربط فوري بدون كود، والملكية للمستخدم الحالي دائماً
+            active_clients[phone] = new_client
+            set_account_owner(phone, state.get('owner') or user_id)
+            save_session_string(phone, new_client)
+            _owner_done = state.get('owner') or user_id
+            del login_states[user_id]
+            await event.respond(
+                f"✅ تم ربط الحساب `{phone}` بنجاح — **بدون كود تحقق!**\n\n"
+                "♻️ توجد جلسة صالحة محفوظة لهذا الرقم من ربط سابق فأعدنا استخدامها مباشرة.\n"
+                "📦 جاري استيراد المجموعات وبدء المراقبة..."
+            )
+            logger.info(f"♻️ [{user_id}] أعاد ربط {phone} فوراً من جلسة محفوظة (بدون كود) — المالك: {_owner_done}")
+            try:
+                new_count = await import_groups(new_client)
+                await event.respond(f"📦 تم استيراد `{new_count}` مجموعة (المراقبة تشمل جميع المجموعات).")
+            except Exception as _ig_err:
+                logger.warning(f"⚠️ تعذر استيراد المجموعات لـ {phone}: {_ig_err}")
+            register_handler(new_client, phone)
+            asyncio.create_task(start_monitoring(new_client, phone))
+            return
+        # 📩 طلب كود تحقق جديد من تيليجرام
+        logger.info(f"📩 [{user_id}] طلب كود تحقق جديد لـ {phone} من تيليجرام...")
+        try:
+            try:
+                sent_code = await new_client.send_code_request(phone)
+            except AuthRestartError:
+                # ♻️ جلسة قديمة تطلب إعادة تهيئة تدفق الدخول — نحذف ملف الجلسة المحلي ونبدأ جلسة نظيفة
+                try:
+                    await new_client.disconnect()
+                except Exception:
+                    pass
+                try:
+                    _sess_path = os.path.join(SESSION_DIR, f'session_{phone}.session')
+                    if os.path.exists(_sess_path):
+                        os.remove(_sess_path)
+                except Exception:
+                    pass
+                logger.info(f"♻️ جلسة قديمة لـ {phone} طلبت إعادة تهيئة (AuthRestart) — أُنشئت جلسة نظيفة")
+                new_client = TelegramClient(os.path.join(SESSION_DIR, f'session_{phone}'), API_ID, API_HASH, **CLIENT_OPTS)
+                state['tmp_client'] = new_client
+                await new_client.connect()
+                sent_code = await new_client.send_code_request(phone)
+            # ✅ نجح طلب الكود — سجّل نوع التوصيل الفعلي (تطبيق/SMS/مكالمة)
+            _channel = _code_channel_line(sent_code)
+            _hash = sent_code.phone_code_hash
+            logger.info(f"✅ [{user_id}] أُرسل كود التحقق لـ {phone} بنجاح | القناة: {type(getattr(sent_code, 'type', None)).__name__} | hash موجود: {bool(_hash)}")
+            if not _hash:
+                # 🔴 hash فارغ = لا يمكن تسجيل الدخول لاحقاً — نعالج فوراً بدل فشل غامض عند إدخال الكود
+                raise RuntimeError("لم يستلم البوت معرّف الكود (phone_code_hash) من تيليجرام — جرّب إعادة الإضافة بعد دقيقة")
+            login_states[user_id] = {'step': 'await_code', 'phone': phone, 'hash': _hash, 'client': new_client, 'owner': state.get('owner', user_id), 'last_code_req': time.time(), 'expired_count': 0}
+            await event.respond(
+                f"📩 تم إرسال الكود إلى `{phone}`.\n\n"
+                f"{_channel}\n\n"
+                "⏳ أرسل الكود هنا **فوراً** — صلاحيته دقائق قليلة فقط.\n"
+                "📌 **مهم:** انسخ الكود من **أحدث رسالة** — الأكواد القديمة من محاولات سابقة لا تعمل.\n"
+                "🧷 يمكنك نسخ رسالة الكود **كاملة** وسأستخرج الرقم بنفسي.\n"
+                "⚠️ لا تطلب كوداً من تيليجرام ويب أو أي تطبيق آخر بالتوازي — كل طلب جديد **يُبطل** هذا الكود.\n"
+                "💡 للإلغاء أرسل: `/cancel`",
+                buttons=[[Button.inline('🔁 لم يصل الكود؟ إعادة الإرسال', b'resend_code')]]
+            )
+        except SendCodeUnavailableError:
+            await event.respond(
+                "📵 **تيليجرام غير قادر على إرسال كود لهذا الرقم حالياً** (تعذر التوصيل عبر التطبيق وSMS).\n\n"
+                "⏳ انتظر 10-15 دقيقة ثم أعد ➕ إضافة الحساب — أو تأكد أن الرقم يستطيع استقبال SMS."
+            )
+            logger.warning(f"📵 [{user_id}] SendCodeUnavailable لـ {phone}")
+        except FloodWaitError as fw:
+            # ⛔ تيليجرام حظر طلبات الكود مؤقتاً — نُبقي الحالة ليعيد بعد المدة
+            await event.respond(
+                f"⛔ **تيليجرام يطلب الانتظار {fw.seconds} ثانية** قبل إرسال كود لهذا الرقم (بسبب طلبات متكررة).\n\n"
+                f"⏳ انتظر المدة المذكورة ثم أعد إرسال الرقم هنا، أو أرسل `/cancel`."
+            )
+            logger.warning(f"⛔ [{user_id}] FloodWait {fw.seconds}ث عند طلب كود {phone}")
+        except PhoneNumberFloodError:
+            # ⛔ كثرة أكواد لهذا الرقم — حظر طويل نسبياً
+            await event.respond(
+                "⛔ **تم إرسال أكواد كثيرة لهذا الرقم مؤخراً** — تيليجرام يمنع إرسال أكواد جديدة مؤقتاً (قد تدوم ساعة أو أكثر).\n\n"
+                "⏳ انتظر فترة ثم أعد المحاولة من ➕ إضافة حسابي، أو أرسل `/cancel`."
+            )
+            logger.warning(f"⛔ [{user_id}] PhoneNumberFlood عند طلب كود {phone}")
+        except PhoneNumberInvalidError:
+            # ❌ تنسيق الرقم خاطئ — نُبقي الحالة ليعيد إرسال الرقم مباشرة
+            await event.respond(
+                "❌ **تنسيق الرقم غير صحيح.**\n\n"
+                "أرسل الرقم مع مفتاح الدولة — مثال: `+9665xxxxxxxx`\n"
+                "💡 أعد إرسال الرقم الآن بالصيغة الصحيحة، أو أرسل `/cancel` للإلغاء."
+            )
+            logger.warning(f"❌ [{user_id}] تنسيق رقم غير صحيح: {phone}")
+    except Exception as e:
+        # 🧹 نغلق العميل المعلق قبل حذف الحالة — يمنع بقاء ملف الجلسة مفتوحاً عند إعادة المحاولة
+        logger.error(f"❌ [{user_id}] خطأ في تدفق إضافة الحساب {state.get('phone', '?')}: {type(e).__name__}: {e}")
+        _tc = state.get('tmp_client')
+        if _tc is not None:
+            try:
+                await _tc.disconnect()
+            except Exception:
+                pass
+        if 'database is locked' in str(e).lower():
+            await event.respond(
+                "🔒 **قاعدة بيانات الجلسة مشغولة مؤقتاً** (كان ملف الجلسة مفتوحاً من عملية أخرى).\n\n"
+                "⏳ انتظر 30 ثانية ثم أعد المحاولة من ➕ إضافة حسابي — البوت يغلق العملية القديمة تلقائياً الآن.\n"
+                "💡 إن تكررت: أعد تشغيل عملية الإضافة بعد دقيقة واحدة."
+            )
+            del login_states[user_id]
+        else:
+            await event.respond(f"❌ خطأ: {e}"); del login_states[user_id]
+
 async def setup_bot_handlers():
     @bot.on(events.NewMessage(pattern='/start'))
     async def start_handler(event):
@@ -2026,6 +2229,45 @@ async def setup_bot_handlers():
 
         elif data == b'noop_page':
             await event.answer()
+
+        elif data == b'resend_code':
+            # 🔁 إعادة إرسال كود التحقق عند عدم وصوله (بديل force_sms المعطوب في telethon 1.36 — عبر ResendCodeRequest يدوياً)
+            st = login_states.get(user_id)
+            if not st or st.get('step') != 'await_code' or not st.get('phone'):
+                await event.answer("⚠️ لا توجد عملية تسجيل جارية — اضغط ➕ إضافة حسابي أولاً.", alert=True)
+                return
+            _now = time.time()
+            _elapsed = _now - st.get('last_code_req', 0)
+            if _elapsed < 60:
+                await event.answer(f"⏳ انتظر {int(60 - _elapsed)} ثانية قبل طلب كود آخر.", alert=True)
+                return
+            _rc = st.get('client')
+            if _rc is None:
+                await event.answer("⚠️ انقطعت العملية — أعد ➕ إضافة الحساب من جديد.", alert=True)
+                return
+            try:
+                if not _rc.is_connected():
+                    await _rc.connect()
+                logger.info(f"🔁 [{user_id}] طلب إعادة إرسال الكود لـ {st['phone']} (ResendCodeRequest)...")
+                _res = await _rc(ResendCodeRequest(st['phone'], st['hash']))
+                st['hash'] = getattr(_res, 'phone_code_hash', None) or st['hash']
+                st['last_code_req'] = _now
+                st['expired_count'] = 0
+                _ch2 = _code_channel_line(_res)
+                await event.answer("✅ أُرسل كود جديد!")
+                await event.respond(
+                    f"🔁 **أُرسل كود جديد إلى `{st['phone']}`**\n\n"
+                    f"{_ch2}\n\n"
+                    "📌 انسخ الكود من **أحدث رسالة** وأرسله هنا فوراً.\n"
+                    "💡 للإلغاء أرسل: `/cancel`"
+                )
+                logger.info(f"✅ [{user_id}] أُعيد إرسال الكود لـ {st['phone']} بنجاح | القناة: {type(getattr(_res, 'type', None)).__name__}")
+            except FloodWaitError as _fw:
+                logger.warning(f"⛔ [{user_id}] FloodWait {_fw.seconds}ث عند إعادة إرسال الكود لـ {st['phone']}")
+                await event.answer(f"⛔ انتظر {_fw.seconds} ثانية ثم أعد المحاولة.", alert=True)
+            except Exception as _re_err:
+                logger.warning(f"❌ [{user_id}] فشل إعادة إرسال الكود لـ {st['phone']}: {type(_re_err).__name__}: {_re_err}")
+                await event.answer(f"❌ تعذر الإرسال: {str(_re_err)[:80]}", alert=True)
 
         elif data.startswith(b'umonp_'):
             # 📄 تنقل صفحات قائمة المستخدمين
@@ -3540,7 +3782,17 @@ async def setup_bot_handlers():
     @bot.on(events.NewMessage())
     async def input_handler(event):
         user_id = event.sender_id
-        if user_id not in login_states: return
+        if user_id not in login_states:
+            # 💡 تلميح واضح فقط عندما يبدو النص رقماً هاتف (يبدأ بـ+) في الخاص — يمنع الصمت المفاجئ
+            # (حالة شائعة: ضغط المستخدم ➕ ثم أُعيد نشر البوت فاختفت حالة الذاكرة → كان يتجاهل رقمه بصمت)
+            if event.is_private:
+                _t0 = (event.message.message or '').strip()
+                if _t0.startswith('+') and _phone_digits(_t0) and is_admin(user_id):
+                    await event.respond(
+                        "ℹ️ **لا توجد عملية تسجيل جارية** (ربما أُعيد تشغيل البوت أو ضاع زر الإضافة).\n\n"
+                        "📱 اضغط ➕ **إضافة حسابي** من القائمة الرئيسية ثم أرسل رقمك من جديد."
+                    )
+            return
         # ===== فحص صلاحية الأدمن لكل إدخال =====
         if not is_admin(user_id):
             await event.respond(UNAUTHORIZED_MSG)
@@ -3747,166 +3999,30 @@ async def setup_bot_handlers():
             logger.info(f"🎯 المستخدم {user_id} اعتمد قروب توجيه ذاتياً: {gid} ({title})")
             del login_states[user_id]
 
-        # إضافة حساب - رقم الهاتف
+        # إضافة حساب - رقم الهاتف (المنطق الكامل مُستخرَج لدالة مشتركة — يُعاد تشغيلها من await_code أيضاً)
         elif state['step'] == 'await_phone':
-            phone = normalize_phone(text.strip())  # ⭐ توحيد الصيغة: يمنع ازدواج الحساب بأشكال مختلفة لنفس الرقم
-            state['phone'] = phone  # نحفظ الرقم الموحّد في الحالة فوراً (يُستخدم في التنظيف والمطابقة)
-            # 🧹 إن كانت هناك محاولة سابقة معلقة لنفس المستخدم — أغلق عميلها قبل إنشاء عميل جديد
-            # (بدون هذا يُفتح ملف الجلسة من عميلين → database is locked عند إعادة إرسال الرقم)
-            _prev = state.get('tmp_client')
-            if _prev is not None:
-                try:
-                    await _prev.disconnect()
-                except Exception:
-                    pass
-                state.pop('tmp_client', None)
-            # 🔒 منع خطأ database is locked: ملف الجلسة (SQLite) لا يُفتح من عميلين معاً —
-            # نغلق أي عميل قديم مفتوح على نفس الرقم قبل إنشاء عميل جديد
-            # 1) محاولات تسجيل معلقة على نفس الرقم بأي صيغة (من مستخدمين آخرين — حالة المستخدم الحالي عُولجت أعلاه)
-            _phone_d = _phone_digits(phone)
-            for _uid, _st in list(login_states.items()):
-                if _uid == user_id:
-                    continue
-                if _phone_d and _phone_digits(_st.get('phone')) == _phone_d and _st.get('step') in ('await_code', 'await_password', 'await_phone'):
-                    for _cl in (_st.get('client'), _st.get('tmp_client')):
-                        if _cl is not None:
-                            try:
-                                await _cl.disconnect()
-                            except Exception:
-                                pass
-                    login_states.pop(_uid, None)
-                    try:
-                        await bot.send_message(_uid, f"ℹ️ أُلغيت عملية تسجيل الحساب `{phone}` لأن مستخدماً آخر أضاف نفس الرقم الآن.")
-                    except Exception:
-                        pass
-                    logger.info(f"🔒 أُغلق عميل تسجيل معلق على {phone} (كان للمستخدم {_uid}) لمنع database is locked")
-            # 2) عميل مراقب نشط لنفس الرقم بأي صيغة (مستعاد بعد النشر أو مربوط سابقاً)
-            akey, old_active = find_active_client(phone)
-            if old_active is not None:
-                try:
-                    already_auth = await old_active.is_user_authorized()
-                except Exception:
-                    already_auth = False
-                if already_auth:
-                    # ✅ الحساب يعمل فعلاً — يُربط بحساب المستخدم مباشرة بدون كود وبدون أي تحقق إضافي
-                    # (الآلية كما كانت: حتى لو مضاف مسبقاً لدى مستخدم آخر — ينضاف فوراً بدون خطأ)
-                    set_account_owner(akey, state.get('owner') or user_id)
-                    del login_states[user_id]
-                    await event.respond(
-                        f"✅ الحساب `{akey}` **مربوط ويعمل بالفعل** — رُبط بحسابك الآن بدون أي كود.\n\n"
-                        "🔑 يمكنك إدارة كلماته وإعداداته وقروب توجيهه من قائمتك مباشرة."
-                    )
-                    logger.info(f"✅ المستخدم {user_id} ربط {akey} المربوط مسبقاً بنفسه مباشرة (بدون كود)")
-                    return
-                # عميل ميت/غير مصرح — أغلقه ونكمل التسجيل من جديد
-                try:
-                    await old_active.disconnect()
-                except Exception:
-                    pass
-                active_clients.pop(akey, None)
-                logger.info(f"🔒 أُغلق عميل مراقب قديم غير مصرح لـ {akey} قبل إعادة التسجيل (database is locked)")
-            new_client = TelegramClient(find_session_path(phone), API_ID, API_HASH, **CLIENT_OPTS)
-            state['tmp_client'] = new_client  # نحفظ المرجع فوراً — يُغلق تلقائياً عند إعادة المحاولة أو الإلغاء
-            await new_client.connect()
-            # ✨ استرداد فوري بدون كود: إن كانت جلسة هذا الرقم محفوظة على القرص (بأي صيغة) ومصرّحاً بها من قبل
-            # (الحساب أُضيف سابقاً ثم فُقد من قائمة الحسابات النشطة بعد إعادة نشر أو خطأ استئناف) —
-            # نستخدم الجلسة مباشرة بدون أي كود تحقق (طلب كود من جلسة مصرّح بها كان يسبب «انتهت صلاحية الكود» فوراً)
-            try:
-                _pre_auth = await new_client.is_user_authorized()
-            except Exception:
-                _pre_auth = False
-            if _pre_auth:
-                # ✅ جلسة صالحة محفوظة — ربط فوري بدون كود، والملكية للمستخدم الحالي دائماً (كما كانت الآلية)
-                active_clients[phone] = new_client
-                set_account_owner(phone, state.get('owner') or user_id)
-                save_session_string(phone, new_client)
-                _owner_done = state.get('owner') or user_id
-                del login_states[user_id]
-                await event.respond(
-                    f"✅ تم ربط الحساب `{phone}` بنجاح — **بدون كود تحقق!**\n\n"
-                    "♻️ توجد جلسة صالحة محفوظة لهذا الرقم من ربط سابق فأعدنا استخدامها مباشرة.\n"
-                    "📦 جاري استيراد المجموعات وبدء المراقبة..."
-                )
-                logger.info(f"♻️ المستخدم {user_id} أعاد ربط {phone} فوراً من جلسة محفوظة مصرّح بها (بدون كود) — المالك: {_owner_done}")
-                try:
-                    new_count = await import_groups(new_client)
-                    await event.respond(f"📦 تم استيراد `{new_count}` مجموعة (المراقبة تشمل جميع المجموعات).")
-                except Exception as _ig_err:
-                    logger.warning(f"⚠️ تعذر استيراد المجموعات لـ {phone}: {_ig_err}")
-                register_handler(new_client, phone)
-                asyncio.create_task(start_monitoring(new_client, phone))
-                return
-            try:
-                try:
-                    sent_code = await new_client.send_code_request(phone)
-                except AuthRestartError:
-                    # ♻️ جلسة قديمة تطلب إعادة تهيئة تدفق الدخول — نحذف ملف الجلسة المحلي ونبدأ جلسة نظيفة
-                    try:
-                        await new_client.disconnect()
-                    except Exception:
-                        pass
-                    try:
-                        _sess_path = os.path.join(SESSION_DIR, f'session_{phone}.session')
-                        if os.path.exists(_sess_path):
-                            os.remove(_sess_path)
-                    except Exception:
-                        pass
-                    logger.info(f"♻️ جلسة قديمة لـ {phone} طلبت إعادة تهيئة (AuthRestart) — أُنشئت جلسة نظيفة")
-                    new_client = TelegramClient(os.path.join(SESSION_DIR, f'session_{phone}'), API_ID, API_HASH, **CLIENT_OPTS)
-                    state['tmp_client'] = new_client
-                    await new_client.connect()
-                    sent_code = await new_client.send_code_request(phone)
-                login_states[user_id] = {'step': 'await_code', 'phone': phone, 'hash': sent_code.phone_code_hash, 'client': new_client, 'owner': state.get('owner', user_id), 'last_code_req': time.time(), 'expired_count': 0}
-                await event.respond(
-                    f"📩 تم إرسال الكود إلى `{phone}`.\n\n"
-                    "📥 **من أين يأتي الكود؟**\n"
-                    "• إذا كان الحساب مفتوحاً في تطبيق تيليجرام (أي جهاز) → الكود يصل **رسالة داخل التطبيق** من محادثة **Telegram** الرسمية — افتحها وانسخ الكود.\n"
-                    "• إذا لم يكن الحساب مفتوحاً في أي مكان → يصلك **SMS** على الرقم.\n\n"
-                    "⏳ أرسل الكود هنا **فوراً** — صلاحيته دقائق قليلة فقط.\n"
-                    "📌 **مهم:** انسخ الكود من **أحدث رسالة** في محادثة Telegram — الأكواد القديمة من محاولات سابقة لا تعمل.\n"
-                    "🧷 يمكنك نسخ رسالة الكود **كاملة** وسأستخرج الرقم بنفسي.\n"
-                    "⚠️ لا تطلب كوداً من تيليجرام ويب أو أي تطبيق آخر بالتوازي — كل طلب جديد **يُبطل** هذا الكود.\n"
-                    "💡 للإلغاء أرسل: `/cancel`"
-                )
-            except PhoneNumberInvalidError:
-                # ❌ تنسيق الرقم خاطئ — نُبقي الحالة ليعيد إرسال الرقم مباشرة
-                await event.respond(
-                    "❌ **تنسيق الرقم غير صحيح.**\n\n"
-                    "أرسل الرقم مع مفتاح الدولة — مثال: `+9665xxxxxxxx`\n"
-                    "💡 أعد إرسال الرقم الآن بالصيغة الصحيحة، أو أرسل `/cancel` للإلغاء."
-                )
-            except FloodWaitError as fw:
-                # ⛔ تيليجرام حظر طلبات الكود مؤقتاً — نُبقي الحالة ليعيد بعد المدة
-                await event.respond(
-                    f"⛔ **تيليجرام يطلب الانتظار {fw.seconds} ثانية** قبل إرسال كود لهذا الرقم (بسبب طلبات متكررة).\n\n"
-                    f"⏳ انتظر المدة المذكورة ثم أعد إرسال الرقم هنا، أو أرسل `/cancel`."
-                )
-            except PhoneNumberFloodError:
-                # ⛔ كثرة أكواد لهذا الرقم — حظر طويل نسبياً
-                await event.respond(
-                    "⛔ **تم إرسال أكواد كثيرة لهذا الرقم مؤخراً** — تيليجرام يمنع إرسال أكواد جديدة مؤقتاً (قد تدوم ساعة أو أكثر).\n\n"
-                    "⏳ انتظر فترة ثم أعد المحاولة من ➕ إضافة حسابي، أو أرسل `/cancel`."
-                )
-            except Exception as e:
-                # 🧹 نغلق العميل المعلق قبل حذف الحالة — يمنع بقاء ملف الجلسة مفتوحاً عند إعادة المحاولة
-                _tc = state.get('tmp_client')
-                if _tc is not None:
-                    try:
-                        await _tc.disconnect()
-                    except Exception:
-                        pass
-                if 'database is locked' in str(e).lower():
-                    await event.respond(
-                        "🔒 **قاعدة بيانات الجلسة مشغولة مؤقتاً** (كان ملف الجلسة مفتوحاً من عملية أخرى).\n\n"
-                        "⏳ انتظر 30 ثانية ثم أعد المحاولة من ➕ إضافة حسابي — البوت يغلق العملية القديمة تلقائياً الآن.\n"
-                        "💡 إن تكررت: أعد تشغيل عملية الإضافة بعد دقيقة واحدة."
-                    )
-                    del login_states[user_id]
-                else:
-                    await event.respond(f"❌ خطأ: {e}"); del login_states[user_id]
+            await run_phone_login_flow(event, user_id, text)
 
         # إضافة حساب - رمز التحقق
         elif state['step'] == 'await_code':
+            # 📞 إذا أرسل المستخدم **رقم هاتف** بدل الكود (يبدأ بـ+ أو 9 خانات فأكثر) — أعد تدفق الإضافة تلقائياً بطلب كود جديد
+            # (سلوك طبيعي: الكود لا يصل → المستخدم يعيد إرسال رقمه فيطلب كوداً جديداً بدل أن يُعامَل الرقم ككود خاطئ)
+            _txt0 = (text or '').strip()
+            _dig0 = _phone_digits(_txt0.translate(_CODE_DIGITS_MAP))
+            # هاتف: يبدأ بـ+ ومعه 7 خانات فأكثر، أو 9 خانات فأكثر بدون + — الأكواد 4-8 خانات فلا تُلَبس
+            if (_txt0.startswith('+') and len(_dig0) >= 7) or len(_dig0) >= 9:
+                logger.info(f"📞 [{user_id}] أرسل رقماً ({_txt0}) أثناء انتظار الكود — إعادة تدفق الإضافة بطلب كود جديد")
+                for _k in ('client', 'tmp_client'):
+                    _cl = state.get(_k)
+                    if _cl is not None:
+                        try:
+                            await _cl.disconnect()
+                        except Exception:
+                            pass
+                login_states[user_id] = {'step': 'await_phone', 'owner': state.get('owner') or user_id}
+                await event.respond("📱 استلمت رقم الهاتف — جاري طلب **كود تحقق جديد** لهذا الرقم...")
+                await run_phone_login_flow(event, user_id, text)
+                return
             try:
                 client = state['client']
                 if client is None:
