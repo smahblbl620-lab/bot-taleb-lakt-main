@@ -7,7 +7,7 @@ import time
 import shutil
 from functools import lru_cache
 from telethon import TelegramClient, events, Button
-from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, PhoneCodeExpiredError, FloodWaitError, PhoneNumberFloodError, PhoneNumberInvalidError, AuthRestartError
+from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, PhoneCodeExpiredError, FloodWaitError, PhoneNumberFloodError, PhoneNumberInvalidError, AuthRestartError, PasswordHashInvalidError
 from telethon.sessions import StringSession
 from telethon.tl.types import Chat, Channel, ChatInviteAlready
 from telethon.tl.functions.messages import ExportChatInviteRequest, CheckChatInviteRequest
@@ -4197,7 +4197,11 @@ async def setup_bot_handlers():
         # إضافة حساب - كلمة المرور (2FA)
         elif state['step'] == 'await_password':
             try:
-                client = state['client']
+                client = state.get('client')
+                if client is None:
+                    del login_states[user_id]
+                    await event.respond("⚠️ انقطعت عملية التسجيل — أعد ➕ إضافة حسابي من جديد.")
+                    return
                 # 🔌 التأكد من الاتصال قبل تسجيل الدخول
                 if not client.is_connected():
                     await client.connect()
@@ -4220,6 +4224,13 @@ async def setup_bot_handlers():
                 register_handler(client, state['phone'])
                 asyncio.create_task(start_monitoring(client, state['phone']))
                 del login_states[user_id]
+            except PasswordHashInvalidError:
+                # ❌ كلمة سر التحقق بخطوتين خاطئة — نُبقي الحالة ليعيد المحاولة فوراً (بدل إلغاء العملية كلها)
+                await event.respond(
+                    "❌ **كلمة السر غير صحيحة.**\n\n"
+                    "🔐 هذا الحساب محمي بالتحقق بخطوتين — أرسل كلمة السر الصحيحة الآن لإعادة المحاولة.\n"
+                    "💡 للإلغاء أرسل: `/cancel`"
+                )
             except Exception as e:
                 await event.respond(f"❌ خطأ: {e}"); del login_states[user_id]
 
