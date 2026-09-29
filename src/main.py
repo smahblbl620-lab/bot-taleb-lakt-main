@@ -156,12 +156,12 @@ def is_main_admin(user_id):
     """فحص إذا كان المستخدم أدمناً كامل الصلاحيات (الأدمن الرئيسي أو أحد الأدمنة الثابتين)"""
     return user_id == MAIN_ADMIN_ID or user_id in EXTRA_MAIN_ADMINS
 
-# نص رسالة الرفض لغير المصرح لهم (يظهر عند استخدام البوت من مستخدم ليس مشرفاً)
-UNAUTHORIZED_MSG = (
-    "📢 لطلب التفعيل والحصول على صلاحية الدخول إلى البوت، يرجى التواصل مع أدمن البوت أو المالك مباشرةً عبر الحسابات التالية:\n\n"
+# نص رسالة الحظر (يظهر لمستخدم حذفه الأدمن وحظره من قائمة إدارة المستخدمين)
+BANNED_MSG = (
+    "🚫 **حسابك محظور من استخدام هذا البوت.**\n\n"
+    "للتواصل مع الإدارة:\n"
     "👉 @ppppokl\n"
-    "👉 @drpharmacistgg\n\n"
-    "سيتم تفعيل حسابك بعد مراجعة الطلب. شكراً لك!"
+    "👉 @drpharmacistgg"
 )
 
 # ============ نظام الصلاحيات المفصلة (أدمن / مشرف / عضو) ============
@@ -687,6 +687,33 @@ def has_perm(user_id, perm):
     if user_id not in config.get('ADMINS', []):
         return False
     return perm in config.get('ADMIN_PERMISSIONS', {}).get(str(user_id), [])
+
+# الصلاحيات الافتراضية لكل مستخدم جديد يسجَّل تلقائياً (مزايا شخصية فقط — العامة تبقى للأدمن)
+DEFAULT_USER_PERMS = ['view_stats', 'manage_templates']
+
+def ensure_user_registered(user_id):
+    """🔓 البوت مفتوح للجميع مثل بقية البوتات: أي مستخدم يضغط /start يُسجَّل تلقائياً
+    كعضو (رتبة مستخدم + صلاحيات شخصية أساسية) دون موافقة الأدمن.
+    يعيد: False إن كان معروفاً | 'banned' إن كان محظوراً | True إن سُجِّل الآن."""
+    if is_main_admin(user_id):
+        return False
+    config = load_json_config()
+    if user_id in config.get('BANNED_USERS', []):
+        return 'banned'
+    admins = config.get('ADMINS', [])
+    if user_id in admins:
+        return False
+    admins.append(user_id)
+    config['ADMINS'] = admins
+    perms_map = config.setdefault('ADMIN_PERMISSIONS', {})
+    perms_map.setdefault(str(user_id), list(DEFAULT_USER_PERMS))
+    config['ADMIN_PERMISSIONS'] = perms_map
+    roles_map = config.setdefault('ADMIN_ROLES', {})
+    roles_map.setdefault(str(user_id), 'user')
+    config['ADMIN_ROLES'] = roles_map
+    update_json_config(config)
+    logger.info(f"🔓 تسجيل تلقائي لمستخدم جديد: {user_id} — البوت مفتوح بدون موافقة الأدمن")
+    return True
 
 # ============ الحفظ الدائم للجلسات (StringSession في config على الـ Volume) ============
 
@@ -1453,10 +1480,11 @@ async def setup_bot_handlers():
     @bot.on(events.NewMessage(pattern='/start'))
     async def start_handler(event):
         user_id = event.sender_id
-        # ===== فحص صلاحية الأدمن =====
-        if not is_admin(user_id):
-            await event.respond(UNAUTHORIZED_MSG)
-            logger.warning(f"🚫 محاولة استخدام غير مصرح بها من user_id={user_id}")
+        # ===== 🔓 البوت مفتوح للجميع: تسجيل تلقائي لأي مستخدم جديد (بدون موافقة الأدمن) =====
+        reg = ensure_user_registered(user_id)
+        if reg == 'banned':
+            await event.respond(BANNED_MSG)
+            logger.warning(f"⛔ مستخدم محظور حاول الدخول: {user_id}")
             return
         
         # ===== بناء القائمة حسب الصلاحيات المفصلة (الأدمن يتحكم بالأزرار التي تظهر لكل مستخدم) =====
@@ -1506,11 +1534,14 @@ async def setup_bot_handlers():
         else:
             role_label = ROLES.get(get_user_role(user_id), '👤 مستخدم')
             perms_desc = [desc for key, desc in PERMISSIONS.items() if has_perm(user_id, key)]
-            welcome = (f"👋 **أهلاً بك!** — رتبتك: {role_label}\n\n🛠 الأزرار المتاحة لك (يحددها الأدمن):\n"
-                       + ("\n".join([f"✅ {d}" for d in perms_desc])
-                          if perms_desc else "⚠️ لا توجد صلاحيات مفعلّة بعد — تواصل مع الأدمن الرئيسي.")
-                       + "\n\n🎯 اعتمد **قروب توجيه رسائلك** بنفسك من زر (🎯 قروب توجيه رسائلي) دون تدخل أحد."
-                         "\n🔒 حساباتك وقروباتك وبياناتك تظهر لك أنت فقط — كل مستخدم منفصل تماماً عن غيره.")
+            welcome = (f"👋 **أهلاً بك في البوت!** — رتبتك: {role_label}\n\n"
+                       "✨ **البوت متاح للجميع** — ابدأ فوراً بثلاث خطوات:\n"
+                       "1️⃣ اضغط **➕ إضافة حسابي** وأضف حساب المراقبة الخاص بك (حتى 3 حسابات).\n"
+                       "2️⃣ أضف **كلماتك المفتاحية** التي تلتقط بها رسائلك.\n"
+                       "3️⃣ اعتمد **قروب توجيه رسائلك** بنفسك من زر (🎯 قروب توجيه رسائلي).\n\n"
+                       "🛠 مزايا إضافية مفعّلة لحسابك:\n"
+                       + ("\n".join([f"✅ {d}" for d in perms_desc]) if perms_desc else "— لا شيء إضافي بعد.")
+                       + "\n\n🔒 حساباتك وقروباتك وبياناتك تظهر لك أنت فقط — كل مستخدم منفصل تماماً عن غيره.")
         
         await event.respond(welcome, buttons=buttons)
 
@@ -1574,10 +1605,11 @@ async def setup_bot_handlers():
         user_id = event.sender_id
         data = event.data
         
-        # ===== فحص صلاحية الأدمن لكل عملية =====
-        if not is_admin(user_id):
-            await event.answer("📢 لطلب التفعيل تواصل مع: @ppppokl أو @drpharmacistgg", alert=True)
-            logger.warning(f"🚫 محاولة callback غير مصرح بها من user_id={user_id}, data={data}")
+        # ===== 🔓 البوت مفتوح: تسجيل تلقائي لكل مستخدم قبل معالجة الأزرار =====
+        reg = ensure_user_registered(user_id)
+        if reg == 'banned':
+            await event.answer("🚫 حسابك محظور من استخدام هذا البوت.", alert=True)
+            logger.warning(f"⛔ مستخدم محظور ضغط زراً: {user_id}, data={data}")
             return
         
         config = load_json_config()
@@ -2693,7 +2725,8 @@ async def setup_bot_handlers():
                     msg += f"{i}. `{a}` — {ROLES.get(role, '👤 مستخدم')} — {granted}/{len(PERMISSIONS)} صلاحية\n"
             else:
                 msg += "📋 **المضافون:** لا يوجد\n"
-            msg += ("\n💡 لإضافة مستخدم جديد، أرسل معرّفه الرقمي.\n"
+            msg += ("\n💡 البوت **مفتوح للجميع**: أي مستخدم يضغط /start يُسجَّل تلقائياً كعضو بدون موافقتك.\n"
+                    "💡 استخدم (حذف مستخدم) لحذف عضو **وحظره** نهائياً — المحظور لا يعود تلقائياً.\n"
                     "💡 الرتبتان: أدمن (كل الصلاحيات) ومستخدم (يضيف حسابه ويستخدم ما تسمح به صلاحياته).")
             buttons = [
                 [Button.inline('➕ إضافة مستخدم', b'add_admin')],
@@ -2725,7 +2758,7 @@ async def setup_bot_handlers():
             else:
                 buttons = [[Button.inline(str(a), f"del_admin_{a}".encode())] for a in admins]
                 buttons.append([Button.inline('🔙 رجوع', b'manage_admins')])
-                await event.respond("🗑 اختر المستخدم الذي تريد حذفه:", buttons=buttons)
+                await event.respond("🗑 اختر المستخدم الذي تريد **حذفه وحظره** (المحظور لا يُسجَّل تلقائياً مجدداً):", buttons=buttons)
         
         elif data.startswith(b'del_admin_'):
             if not has_perm(user_id, 'add_admins'):
@@ -2748,9 +2781,14 @@ async def setup_bot_handlers():
                 ug_map = config.get('USER_GROUPS', {})
                 ug_map.pop(str(admin_id), None)
                 config['USER_GROUPS'] = ug_map
+                # ⛔ حظر فعلي: بدون هذا سيعود المستخدم تلقائياً فور ضغطه /start (البوت مفتوح)
+                banned = config.get('BANNED_USERS', [])
+                if admin_id not in banned:
+                    banned.append(admin_id)
+                config['BANNED_USERS'] = banned
                 update_json_config(config)
-                await event.respond(f"✅ تم حذف المستخدم `{admin_id}`.")
-                logger.info(f"👑 الأدمن حذف مستخدم: {admin_id}")
+                await event.respond(f"✅ تم حذف المستخدم `{admin_id}` **وحظره** — لن يستطيع الدخول إلى البوت تلقائياً مجدداً.")
+                logger.info(f"👑 الأدمن حذف وحظر مستخدم: {admin_id}")
             else:
                 await event.respond("❌ المستخدم غير موجود.")
 
@@ -3414,7 +3452,7 @@ async def setup_bot_handlers():
             try:
                 _t = (event.message.message or '').strip()
                 _phone_like = _t.startswith('+') or (_t.isdigit() and 10 <= len(_t) <= 15)
-                if _phone_like and event.is_private and is_admin(user_id):
+                if _phone_like and event.is_private:
                     await event.respond(
                         "ℹ️ لا توجد عملية إضافة جارية الآن — اضغط زر **➕ إضافة حسابي** (أو ➕ إضافة حساب للأدمن) ثم أرسل الرقم عندما يُطلب منك.\n\n"
                         "💡 يحدث هذا غالباً بعد إعادة تشغيل البوت أو انتهاء/إلغاء العملية السابقة — ابدأ من الزر لعملية نظيفة."
@@ -3423,9 +3461,10 @@ async def setup_bot_handlers():
             except Exception:
                 pass
             return
-        # ===== فحص صلاحية الأدمن لكل إدخال =====
-        if not is_admin(user_id):
-            await event.respond(UNAUTHORIZED_MSG)
+        # ===== 🔓 البوت مفتوح: تسجيل تلقائي قبل قبول الإدخال =====
+        reg = ensure_user_registered(user_id)
+        if reg == 'banned':
+            await event.respond(BANNED_MSG)
             del login_states[user_id]
             return
         state = login_states[user_id]
@@ -3505,11 +3544,16 @@ async def setup_bot_handlers():
                     admins.append(new_admin_id)
                     config['ADMINS'] = admins
                     perms_map = config.get('ADMIN_PERMISSIONS', {})
-                    perms_map[str(new_admin_id)] = ['view_stats']
+                    perms_map[str(new_admin_id)] = list(DEFAULT_USER_PERMS)
                     config['ADMIN_PERMISSIONS'] = perms_map
                     roles_map = config.get('ADMIN_ROLES', {})
                     roles_map[str(new_admin_id)] = 'user'
                     config['ADMIN_ROLES'] = roles_map
+                    # فك الحظر إن كان محظوراً — الإضافة اليدوية من الأدمن قرار صريح
+                    banned = config.get('BANNED_USERS', [])
+                    if new_admin_id in banned:
+                        banned.remove(new_admin_id)
+                        config['BANNED_USERS'] = banned
                     update_json_config(config)
                     await event.respond(
                         f"✅ تم إضافة المستخدم `{new_admin_id}` بنجاح!\n\n"
